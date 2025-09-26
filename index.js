@@ -1,3 +1,4 @@
+// index.js
 import express from "express";
 import multer from "multer";
 import cors from "cors";
@@ -9,19 +10,21 @@ import { randomUUID } from "crypto";
 import { SpeechClient } from "@google-cloud/speech";
 import { scoreAttempt } from "./score.js";
 
-// 🔸 Vertex AI (임베딩 + Gemini 코칭)
+// ── Vertex AI (임베딩 + Gemini 코칭)
 import { VertexAI } from "@google-cloud/vertexai";
 const vertex = new VertexAI({
   project: process.env.GCP_PROJECT_ID,
-  location: process.env.GCP_LOCATION, // 예: asia-northeast3
+  location: process.env.GCP_LOCATION, // e.g., "asia-northeast3"
 });
 
 const app = express();
 app.use(cors());
+app.use(express.json());
 
 const upload = multer({ limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB
-const speech = new SpeechClient(); // GOOGLE_APPLICATION_CREDENTIALS 사용
+const speech = new SpeechClient(); // uses GOOGLE_APPLICATION_CREDENTIALS
 
+// ── webm/mp4/ogg/mp3 → WAV(PCM_S16LE, mono, 16k)
 function toLinear16(inputPath, outPath) {
   return new Promise((resolve, reject) => {
     ffmpeg(inputPath)
@@ -33,6 +36,7 @@ function toLinear16(inputPath, outPath) {
 }
 
 app.get("/", (_, res) => res.send("OK speaking tutor server"));
+app.get("/healthz", (_, res) => res.json({ ok: true }));
 
 function cosine(a, b) {
   const dot = a.reduce((s, v, i) => s + v * b[i], 0);
@@ -44,6 +48,7 @@ function cosine(a, b) {
 app.post("/stt/score", upload.single("audio"), async (req, res) => {
   let inPath, outPath;
   try {
+    // ── 업로드 유효성
     if (!req.file) {
       return res.status(400).json({ ok: false, error: "audio file is required" });
     }
@@ -51,29 +56,31 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
       return res.status(400).json({ ok: false, error: "empty audio upload" });
     }
 
-    // ✅ 입력 파라미터
+    // ── 입력 파라미터
     const target = req.body?.target || "";
-    const lang = req.body?.lang || "en-US";                // 예: 'en-US' / 'ko-KR'
-    const hints = JSON.parse(req.body?.hints || "[]");     // 예: ["ship","sheep"]
-    const wantSemantic = req.body?.semantic === "1";       // 임베딩 점수
-    const wantCoach = req.body?.coach === "1";             // Gemini 코칭
+    const lang = req.body?.lang || "en-US";                  // e.g., 'en-US' | 'ko-KR'
+    const hints = JSON.parse(req.body?.hints || "[]");       // e.g., ["ship","sheep"]
+    const wantSemantic = req.body?.semantic === "1";         // embedding similarity
+    const wantCoach = req.body?.coach === "1";               // Gemini coaching
 
-    // 1) 업로드 포맷 식별 → wav(LINEAR16 16k mono) 변환
+    // ── 업로드 포맷 식별 → 임시 파일 저장
     const ext =
       req.file.mimetype?.includes("mp4")  ? "mp4"  :
       req.file.mimetype?.includes("mpeg") ? "mp3"  :
       req.file.mimetype?.includes("ogg")  ? "ogg"  :
       req.file.mimetype?.includes("webm") ? "webm" : "dat";
+
     inPath = path.join(tmpdir(), `${randomUUID()}.${ext}`);
     outPath = path.join(tmpdir(), `${randomUUID()}.wav`);
-
     await fs.writeFile(inPath, req.file.buffer);
+
     console.log("[upload]", req.file.mimetype, req.file.size, "->", inPath);
 
+    // ── WAV 변환 + 방어
     try {
       await toLinear16(inPath, outPath);
-    } catch (convErr) {
-      console.error("[ffmpeg]", convErr);
+    } catch (err) {
+      console.error("[ffmpeg]", err);
       return res.status(400).json({ ok: false, error: "audio conversion failed" });
     }
 
@@ -82,30 +89,31 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
       return res.status(400).json({ ok: false, error: "wav conversion produced empty audio" });
     }
 
-    // 2) Google STT v2 (latest_short + phrase hints)
-    const name = `projects/${process.env.GCP_PROJECT_ID}/locations/${process.env.GCP_LOCATION}/recognizers/${process.env.GCP_RECOGNIZER_ID}`;
+    // ── Google STT v2 (latest_short + phrase hints)
+    const recognizer = `projects/${process.env.GCP_PROJECT_ID}/locations/${process.env.GCP_LOCATION}/recognizers/${process.env.GCP_RECOGNIZER_ID}`;
     const [resp] = await speech.recognize({
-      recognizer: name,
+      recognizer,
       config: {
         languageCode: lang,
         model: "latest_short",
         adaptation: hints.length
           ? { phraseSets: [{ phrases: hints.map(v => ({ value: v })), boost: 20.0 }] }
           : undefined,
+        // autoDecodingConfig를 주면 포맷 추정(선택)
+        // autoDecodingConfig: {},
       },
       content: wavBytes.toString("base64"),
     });
 
-    const transcript =
-      (resp.results || [])
-        .map(r => r.alternatives?.[0]?.transcript || "")
-        .join(" ")
-        .trim();
+    const transcript = (resp.results || [])
+      .map(r => r.alternatives?.[0]?.transcript || "")
+      .join(" ")
+      .trim();
 
-    // 3) 규칙 기반 점수 (v0)
+    // ── 규칙 기반 1차 스코어
     const scoring = scoreAttempt({ transcript, targetText: target });
 
-    // 4) (선택) 의미 유사도: Vertex 임베딩
+    // ── (선택) 의미 유사도: Vertex Embedding
     let semantic = null;
     if (wantSemantic && target && transcript) {
       try {
@@ -122,7 +130,7 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
       }
     }
 
-    // 5) (선택) Gemini 코칭 피드백
+    // ── (선택) Gemini 코칭 피드백
     let aiFeedback = null;
     if (wantCoach) {
       try {
@@ -143,7 +151,7 @@ Transcript: """${transcript}"""`;
         try {
           aiFeedback = JSON.parse(text);
         } catch {
-          aiFeedback = { raw: text }; // 모델이 JSON이 아닌 텍스트를 줄 경우
+          aiFeedback = { raw: text }; // 모델이 JSON이 아닌 텍스트를 줄 경우 대비
         }
       } catch (err) {
         console.error("[gemini]", err);
@@ -155,7 +163,7 @@ Transcript: """${transcript}"""`;
     console.error(e);
     res.status(500).json({ ok: false, error: String(e) });
   } finally {
-    // 임시 파일 정리
+    // 임시 파일 정리는 실패해도 무시
     if (inPath) await fs.unlink(inPath).catch(() => {});
     if (outPath) await fs.unlink(outPath).catch(() => {});
   }
