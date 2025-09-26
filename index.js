@@ -1,42 +1,48 @@
 // index.js
 import express from "express";
-import multer from "multer";
 import cors from "cors";
+import multer from "multer";
+
 import ffmpeg from "fluent-ffmpeg";
-import ffmpegPath from "ffmpeg-static";          // ★ ffmpeg 바이너리 포함
+import ffmpegPath from "ffmpeg-static";
+
 import { promises as fs } from "fs";
 import { tmpdir } from "os";
 import path from "path";
 import { randomUUID } from "crypto";
-import { SpeechClient } from "@google-cloud/speech";
+
+import { v2 as speechV2, v1 as speechV1 } from "@google-cloud/speech";
 import { scoreAttempt } from "./score.js";
 
-// ── Vertex AI (임베딩 + Gemini 코칭)
 import { VertexAI } from "@google-cloud/vertexai";
-const vertex = new VertexAI({
-  project: process.env.GCP_PROJECT_ID,
-  location: process.env.GCP_LOCATION, // e.g., "asia-northeast3"
-});
 
-// ── ffmpeg 경로 지정 (Render 등에서 필수)
+// ---------- FFmpeg (Render 등에서 필수)
 if (ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
 
-const app = express();
+// ---------- Vertex AI
+const vertex = new VertexAI({
+  project: process.env.GCP_PROJECT_ID,
+  location: process.env.GCP_LOCATION,
+});
 
-// ── 기본 미들웨어
+// ---------- Speech-to-Text
+const sttV2 = new speechV2.SpeechClient(); // v2 고정
+// v1 폴백용은 실패했을 때 new 해도 되지만, 한 번만 만들어 재사용
+const sttV1 = new speechV1.SpeechClient();
+
+// ---------- Express 기본
+const app = express();
 app.use(cors());
 app.use(express.json());
 app.options("*", cors());
 
-// ── 업로드: 반드시 메모리 저장 사용! (buffer로 받기 위함)
+// 업로드는 반드시 메모리 저장 (buffer 사용)
 const upload = multer({
-  storage: multer.memoryStorage(),              // ★ 중요
+  storage: multer.memoryStorage(),
   limits: { fileSize: 20 * 1024 * 1024 },
 });
 
-const speech = new SpeechClient(); // GOOGLE_APPLICATION_CREDENTIALS 사용
-
-// ── webm/mp4/aac/ogg/mp3 → WAV(PCM_S16LE, mono, 16k)
+// webm/mp4/aac/ogg/mp3 → WAV(PCM_S16LE, mono, 16k)
 function toLinear16(inputPath, outPath) {
   return new Promise((resolve, reject) => {
     ffmpeg(inputPath)
@@ -44,19 +50,14 @@ function toLinear16(inputPath, outPath) {
       .on("start", cmd => console.log("[ffmpeg] start:", cmd))
       .on("stderr", line => console.log("[ffmpeg]", line))
       .on("end", resolve)
-      .on("error", err => {
-        console.error("[ffmpeg error]", err);
-        reject(err);
-      })
+      .on("error", reject)
       .save(outPath);
   });
 }
 
-// ── 헬스 체크
 app.get("/", (_, res) => res.send("OK speaking tutor server"));
 app.get("/healthz", (_, res) => res.json({ ok: true }));
 
-// ── 유틸: 코사인 유사도
 function cosine(a, b) {
   const dot = a.reduce((s, v, i) => s + v * b[i], 0);
   const na = Math.sqrt(a.reduce((s, v) => s + v * v, 0));
@@ -64,30 +65,25 @@ function cosine(a, b) {
   return dot / (na * nb);
 }
 
-// ── STT + 스코어 + (옵션) 임베딩/코칭
 app.post("/stt/score", upload.single("audio"), async (req, res) => {
   let inPath, outPath;
   try {
     // 0) 업로드 유효성
-    if (!req.file) {
-      return res.status(400).json({ ok: false, error: "audio file is required" });
-    }
-    if (!req.file.buffer || !req.file.buffer.length) {
-      return res.status(400).json({ ok: false, error: "empty audio upload" });
-    }
+    if (!req.file) return res.status(400).json({ ok: false, error: "audio file is required" });
+    if (!req.file.buffer?.length) return res.status(400).json({ ok: false, error: "empty audio upload" });
 
     // 1) 입력 파라미터
     const target = req.body?.target || "";
-    const lang = req.body?.lang || "en-US"; // 'en-US' | 'ko-KR' ...
+    const lang = req.body?.lang || "en-US";
     let hints = [];
     try {
       hints = JSON.parse(req.body?.hints || "[]");
       if (!Array.isArray(hints)) hints = [];
     } catch { hints = []; }
-    const wantSemantic = req.body?.semantic === "1"; // 임베딩 유사도
-    const wantCoach    = req.body?.coach === "1";    // Gemini 코칭
+    const wantSemantic = req.body?.semantic === "1";
+    const wantCoach    = req.body?.coach === "1";
 
-    // 2) 업로드 포맷 식별 → 임시 파일 저장
+    // 2) 임시 파일
     const mt = (req.file.mimetype || "").toLowerCase();
     const ext =
       mt.includes("mp4")   ? "mp4"  :
@@ -99,53 +95,63 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
 
     inPath  = path.join(tmpdir(), `${randomUUID()}.${ext}`);
     outPath = path.join(tmpdir(), `${randomUUID()}.wav`);
-
     await fs.writeFile(inPath, req.file.buffer);
-    console.log("[upload]", req.file.mimetype, req.file.size, "->", inPath);
 
-    // 3) WAV 변환(방어)
-    try {
-      await toLinear16(inPath, outPath);
-    } catch (err) {
-      return res.status(400).json({
-        ok: false,
-        error: "audio conversion failed: " + (err?.message || err),
-      });
-    }
-
+    // 3) WAV 변환
+    await toLinear16(inPath, outPath);
     const wavBytes = await fs.readFile(outPath);
     if (!wavBytes.length) {
       return res.status(400).json({ ok: false, error: "wav conversion produced empty audio" });
     }
+    const wavB64 = wavBytes.toString("base64");
 
-    console.log("[stt] lang=%s hints=%d bytes=%d", lang, hints.length, wavBytes.length);
+    // 4) STT 호출: v2 → 실패 시 v1 폴백
+    const recognizer = `projects/${process.env.GCP_PROJECT_ID}/locations/${process.env.GCP_LOCATION}/recognizers/${process.env.GCP_RECOGNIZER_ID}`;
+    let transcript = "";
 
-    // 4) Google STT v2 (latest_short + phrase hints)
-    const recognizer =
-      `projects/${process.env.GCP_PROJECT_ID}/locations/${process.env.GCP_LOCATION}/recognizers/${process.env.GCP_RECOGNIZER_ID}`;
+    try {
+      // ---- v2 (권장) ----
+      const [resp] = await sttV2.recognize({
+        recognizer,
+        config: {
+          languageCode: lang,
+          model: "latest_short",
+          adaptation: hints.length
+            ? { phraseSets: [{ phrases: hints.map(v => ({ value: v })), boost: 20.0 }] }
+            : undefined,
+        },
+        content: wavB64, // v2는 content 필드 (RecognitionAudio 아님)
+      });
 
-    const [resp] = await speech.recognize({
-      recognizer,
-      config: {
-        languageCode: lang,
-        model: "latest_short",
-        adaptation: hints.length
-          ? { phraseSets: [{ phrases: hints.map(v => ({ value: v })), boost: 20.0 }] }
-          : undefined,
-        // 필요 시: autoDecodingConfig: {},
-      },
-      content: wavBytes.toString("base64"),
-    });
+      transcript = (resp.results || [])
+        .map(r => r.alternatives?.[0]?.transcript || "")
+        .join(" ")
+        .trim();
 
-    const transcript = (resp.results || [])
-      .map(r => r.alternatives?.[0]?.transcript || "")
-      .join(" ")
-      .trim();
+    } catch (e) {
+      console.error("[v2 failed -> fallback v1]", e?.message || e);
 
-    // 5) 규칙 기반 스코어
+      // ---- v1 (폴백) ----
+      // v1은 recognizer가 없고, audio:{content} + speechContexts 사용
+      const [resp1] = await sttV1.recognize({
+        config: {
+          languageCode: lang,
+          enableAutomaticPunctuation: true,
+          speechContexts: hints.length ? [{ phrases: hints, boost: 20.0 }] : [],
+        },
+        audio: { content: wavB64 }, // v1형식: RecognitionAudio
+      });
+
+      transcript = (resp1.results || [])
+        .map(r => r.alternatives?.[0]?.transcript || "")
+        .join(" ")
+        .trim();
+    }
+
+    // 5) 스코어링
     const scoring = scoreAttempt({ transcript, targetText: target });
 
-    // 6) (옵션) 의미 유사도: Vertex Embedding
+    // 6) (옵션) 임베딩 유사도
     let semantic = null;
     if (wantSemantic && target && transcript) {
       try {
@@ -156,13 +162,13 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
         ]);
         const a = refE.embeddings[0].values;
         const b = hypE.embeddings[0].values;
-        semantic = Math.round(Math.max(0, Math.min(1, cosine(a, b))) * 100); // 0~100
+        semantic = Math.round(Math.max(0, Math.min(1, cosine(a, b))) * 100);
       } catch (err) {
         console.error("[embedding]", err);
       }
     }
 
-    // 7) (옵션) Gemini 코칭 피드백
+    // 7) (옵션) Gemini 코칭
     let aiFeedback = null;
     if (wantCoach) {
       try {
@@ -181,11 +187,7 @@ Transcript: """${transcript}"""`;
           contents: [{ role: "user", parts: [{ text: prompt }] }],
         });
         const text = r.response?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
-        try {
-          aiFeedback = JSON.parse(text);
-        } catch {
-          aiFeedback = { raw: text }; // 모델이 JSON이 아닌 경우 대비
-        }
+        try { aiFeedback = JSON.parse(text); } catch { aiFeedback = { raw: text }; }
       } catch (err) {
         console.error("[gemini]", err);
       }
@@ -197,8 +199,8 @@ Transcript: """${transcript}"""`;
     console.error(e);
     res.status(500).json({ ok: false, error: String(e) });
   } finally {
-    if (inPath) await fs.unlink(inPath).catch(() => {});
-    if (outPath) await fs.unlink(outPath).catch(() => {});
+    try { if (inPath) await fs.unlink(inPath); } catch {}
+    try { if (outPath) await fs.unlink(outPath); } catch {}
   }
 });
 
