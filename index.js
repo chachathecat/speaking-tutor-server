@@ -3,6 +3,7 @@ import express from "express";
 import multer from "multer";
 import cors from "cors";
 import ffmpeg from "fluent-ffmpeg";
+import ffmpegPath from "ffmpeg-static";          // ★ ffmpeg 바이너리 포함
 import { promises as fs } from "fs";
 import { tmpdir } from "os";
 import path from "path";
@@ -10,32 +11,44 @@ import { randomUUID } from "crypto";
 import { SpeechClient } from "@google-cloud/speech";
 import { scoreAttempt } from "./score.js";
 
-// Vertex AI (임베딩 + Gemini 코칭)
+// ── Vertex AI (임베딩 + Gemini 코칭)
 import { VertexAI } from "@google-cloud/vertexai";
 const vertex = new VertexAI({
   project: process.env.GCP_PROJECT_ID,
   location: process.env.GCP_LOCATION, // e.g., "asia-northeast3"
 });
 
+// ── ffmpeg 경로 지정 (Render 등에서 필수)
+if (ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
+
 const app = express();
 
 // ── 기본 미들웨어
-app.use(cors());                // CORS 허용
-app.use(express.json());        // JSON 바디
-app.options("*", cors());       // Preflight
+app.use(cors());
+app.use(express.json());
+app.options("*", cors());
 
-// 업로드(메모리 저장, 20MB 제한)
-const upload = multer({ limits: { fileSize: 20 * 1024 * 1024 } });
+// ── 업로드: 반드시 메모리 저장 사용! (buffer로 받기 위함)
+const upload = multer({
+  storage: multer.memoryStorage(),              // ★ 중요
+  limits: { fileSize: 20 * 1024 * 1024 },
+});
+
 const speech = new SpeechClient(); // GOOGLE_APPLICATION_CREDENTIALS 사용
 
-// ── webm/mp4/ogg/mp3 → WAV(PCM_S16LE, mono, 16k)
+// ── webm/mp4/aac/ogg/mp3 → WAV(PCM_S16LE, mono, 16k)
 function toLinear16(inputPath, outPath) {
   return new Promise((resolve, reject) => {
     ffmpeg(inputPath)
       .outputOptions(["-ac", "1", "-ar", "16000", "-f", "wav", "-acodec", "pcm_s16le"])
-      .save(outPath)
+      .on("start", cmd => console.log("[ffmpeg] start:", cmd))
+      .on("stderr", line => console.log("[ffmpeg]", line))
       .on("end", resolve)
-      .on("error", reject);
+      .on("error", err => {
+        console.error("[ffmpeg error]", err);
+        reject(err);
+      })
+      .save(outPath);
   });
 }
 
@@ -59,7 +72,7 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
     if (!req.file) {
       return res.status(400).json({ ok: false, error: "audio file is required" });
     }
-    if (!req.file.buffer?.length) {
+    if (!req.file.buffer || !req.file.buffer.length) {
       return res.status(400).json({ ok: false, error: "empty audio upload" });
     }
 
@@ -72,27 +85,32 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
       if (!Array.isArray(hints)) hints = [];
     } catch { hints = []; }
     const wantSemantic = req.body?.semantic === "1"; // 임베딩 유사도
-    const wantCoach = req.body?.coach === "1";       // Gemini 코칭
+    const wantCoach    = req.body?.coach === "1";    // Gemini 코칭
 
     // 2) 업로드 포맷 식별 → 임시 파일 저장
+    const mt = (req.file.mimetype || "").toLowerCase();
     const ext =
-      req.file.mimetype?.includes("mp4")  ? "mp4"  :
-      req.file.mimetype?.includes("mpeg") ? "mp3"  :
-      req.file.mimetype?.includes("ogg")  ? "ogg"  :
-      req.file.mimetype?.includes("webm") ? "webm" : "dat";
+      mt.includes("mp4")   ? "mp4"  :
+      mt.includes("aac")   ? "aac"  :
+      mt.includes("3gpp")  ? "3gp"  :
+      mt.includes("mpeg")  ? "mp3"  :
+      mt.includes("ogg")   ? "ogg"  :
+      mt.includes("webm")  ? "webm" : "dat";
 
-    inPath = path.join(tmpdir(), `${randomUUID()}.${ext}`);
+    inPath  = path.join(tmpdir(), `${randomUUID()}.${ext}`);
     outPath = path.join(tmpdir(), `${randomUUID()}.wav`);
-    await fs.writeFile(inPath, req.file.buffer);
 
+    await fs.writeFile(inPath, req.file.buffer);
     console.log("[upload]", req.file.mimetype, req.file.size, "->", inPath);
 
     // 3) WAV 변환(방어)
     try {
       await toLinear16(inPath, outPath);
     } catch (err) {
-      console.error("[ffmpeg]", err);
-      return res.status(400).json({ ok: false, error: "audio conversion failed" });
+      return res.status(400).json({
+        ok: false,
+        error: "audio conversion failed: " + (err?.message || err),
+      });
     }
 
     const wavBytes = await fs.readFile(outPath);
@@ -179,7 +197,6 @@ Transcript: """${transcript}"""`;
     console.error(e);
     res.status(500).json({ ok: false, error: String(e) });
   } finally {
-    // 임시 파일 정리
     if (inPath) await fs.unlink(inPath).catch(() => {});
     if (outPath) await fs.unlink(outPath).catch(() => {});
   }
