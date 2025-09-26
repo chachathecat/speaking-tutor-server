@@ -45,7 +45,10 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
   let inPath, outPath;
   try {
     if (!req.file) {
-      return res.status(400).json({ ok: false, error: "audio file (webm) is required" });
+      return res.status(400).json({ ok: false, error: "audio file is required" });
+    }
+    if (!req.file.buffer?.length) {
+      return res.status(400).json({ ok: false, error: "empty audio upload" });
     }
 
     // ✅ 입력 파라미터
@@ -55,12 +58,29 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
     const wantSemantic = req.body?.semantic === "1";       // 임베딩 점수
     const wantCoach = req.body?.coach === "1";             // Gemini 코칭
 
-    // 1) webm → wav(LINEAR16 16k mono)
-    inPath = path.join(tmpdir(), `${randomUUID()}.webm`);
+    // 1) 업로드 포맷 식별 → wav(LINEAR16 16k mono) 변환
+    const ext =
+      req.file.mimetype?.includes("mp4")  ? "mp4"  :
+      req.file.mimetype?.includes("mpeg") ? "mp3"  :
+      req.file.mimetype?.includes("ogg")  ? "ogg"  :
+      req.file.mimetype?.includes("webm") ? "webm" : "dat";
+    inPath = path.join(tmpdir(), `${randomUUID()}.${ext}`);
     outPath = path.join(tmpdir(), `${randomUUID()}.wav`);
+
     await fs.writeFile(inPath, req.file.buffer);
-    await toLinear16(inPath, outPath);
+    console.log("[upload]", req.file.mimetype, req.file.size, "->", inPath);
+
+    try {
+      await toLinear16(inPath, outPath);
+    } catch (convErr) {
+      console.error("[ffmpeg]", convErr);
+      return res.status(400).json({ ok: false, error: "audio conversion failed" });
+    }
+
     const wavBytes = await fs.readFile(outPath);
+    if (!wavBytes.length) {
+      return res.status(400).json({ ok: false, error: "wav conversion produced empty audio" });
+    }
 
     // 2) Google STT v2 (latest_short + phrase hints)
     const name = `projects/${process.env.GCP_PROJECT_ID}/locations/${process.env.GCP_LOCATION}/recognizers/${process.env.GCP_RECOGNIZER_ID}`;
