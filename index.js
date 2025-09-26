@@ -8,6 +8,11 @@ import path from "path";
 import { randomUUID } from "crypto";
 import { SpeechClient } from "@google-cloud/speech";
 import { scoreAttempt } from "./score.js";
+import { VertexAI } from "@google-cloud/vertexai";
+const vertex = new VertexAI({
+  project: process.env.GCP_PROJECT_ID,
+  location: process.env.GCP_LOCATION, // 모델 리전
+});
 
 const app = express();
 app.use(cors());
