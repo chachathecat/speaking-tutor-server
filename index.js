@@ -1,3 +1,11 @@
+// index.js (fixed)
+//
+// ✅ 핵심 수정
+// 1) STT v2 요청 형식 정리: autoDecodingConfig/feature만 사용(언어/모델은 Recognizer가 보유)
+// 2) v1 폴백은 기본 OFF. 켜더라도 phraseHints가 있을 때만 붙이도록 방어
+// 3) Vertex AI 리전/모델 환경변수화(기본 us-central1, gemini-1.5-flash-001) + 에러시 조용히 스킵
+// 4) ffmpeg, 파일정리, 타임아웃 그대로 유지
+
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -18,11 +26,15 @@ import { VertexAI } from "@google-cloud/vertexai";
 // ---------- FFmpeg (Render 등에서 필수)
 if (ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
 
-// ---------- Vertex AI  (us-central1 권장)
+// ---------- Env helpers
+const env = (k, d) => (process.env[k] ?? d);
+
+// ---------- Vertex AI (us-central1 권장)
 const vertex = new VertexAI({
-  project: process.env.GCP_PROJECT_ID,
-  location: "us-central1",
+  project: env("GCP_PROJECT_ID", ""),
+  location: env("GEMINI_LOCATION", "us-central1"),
 });
+const GEMINI_MODEL = env("GEMINI_MODEL", "gemini-1.5-flash-001");
 
 // ---------- Speech-to-Text
 const sttV2 = new speechV2.SpeechClient();
@@ -34,7 +46,7 @@ app.use(cors());
 app.use(express.json());
 app.options("*", cors());
 
-// 업로드는 반드시 메모리 저장 (buffer 사용)
+// 업로드는 메모리 저장 (buffer 사용)
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 20 * 1024 * 1024 },
@@ -45,8 +57,8 @@ function toLinear16(inputPath, outPath) {
   return new Promise((resolve, reject) => {
     ffmpeg(inputPath)
       .outputOptions(["-ac", "1", "-ar", "16000", "-f", "wav", "-acodec", "pcm_s16le"])
-      .on("start", cmd => console.log("[ffmpeg] start:", cmd))
-      .on("stderr", line => console.log("[ffmpeg]", line))
+      .on("start", (cmd) => console.log("[ffmpeg] start:", cmd))
+      .on("stderr", (line) => console.log("[ffmpeg]", line))
       .on("end", resolve)
       .on("error", reject)
       .save(outPath);
@@ -72,26 +84,30 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
 
     // 1) 입력 파라미터
     const target = req.body?.target || "";
-    const lang = req.body?.lang || "en-US";
+    // v2에서는 Recognizer가 언어를 가짐. lang은 코칭 텍스트 언어용으로만 활용
+    const langForHints = req.body?.lang || "en-US";
+
     let hints = [];
     try {
       hints = JSON.parse(req.body?.hints || "[]");
       if (!Array.isArray(hints)) hints = [];
-    } catch { hints = []; }
+    } catch {
+      hints = [];
+    }
     const wantSemantic = req.body?.semantic === "1";
-    const wantCoach    = req.body?.coach === "1";
+    const wantCoach = req.body?.coach === "1";
 
     // 2) 임시 파일
     const mt = (req.file.mimetype || "").toLowerCase();
     const ext =
-      mt.includes("mp4")   ? "mp4"  :
-      mt.includes("aac")   ? "aac"  :
-      mt.includes("3gpp")  ? "3gp"  :
-      mt.includes("mpeg")  ? "mp3"  :
-      mt.includes("ogg")   ? "ogg"  :
-      mt.includes("webm")  ? "webm" : "dat";
+      mt.includes("mp4") ? "mp4" :
+      mt.includes("aac") ? "aac" :
+      mt.includes("3gpp") ? "3gp" :
+      mt.includes("mpeg") ? "mp3" :
+      mt.includes("ogg") ? "ogg" :
+      mt.includes("webm") ? "webm" : "dat";
 
-    inPath  = path.join(tmpdir(), `${randomUUID()}.${ext}`);
+    inPath = path.join(tmpdir(), `${randomUUID()}.${ext}`);
     outPath = path.join(tmpdir(), `${randomUUID()}.wav`);
     await fs.writeFile(inPath, req.file.buffer);
 
@@ -103,41 +119,58 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
     }
     const wavB64 = wavBytes.toString("base64");
 
-    // 4) STT 호출: v2 → 실패 시 v1 폴백
-    const recognizer = `projects/${process.env.GCP_PROJECT_ID}/locations/${process.env.GCP_LOCATION}/recognizers/${process.env.GCP_RECOGNIZER_ID}`;
+    // 4) STT 호출: v2 → (옵션) v1 폴백
+    const recognizer =
+      `projects/${env("GCP_PROJECT_ID", "")}/locations/${env("GCP_LOCATION", "global")}/recognizers/${env("GCP_RECOGNIZER_ID", "")}`;
+
     let transcript = "";
 
     try {
-      // v2 (권장)
-      const [resp] = await sttV2.recognize({
+      // v2 (권장) — 언어/모델은 Recognizer 설정에 따름
+      const v2req = {
         recognizer,
         config: {
-          languageCode: lang,
-          model: "latest_short",
-          adaptation: hints.length
-            ? { phraseSets: [{ phrases: hints.map(v => ({ value: v })), boost: 20.0 }] }
-            : undefined,
+          autoDecodingConfig: {}, // 자동 디코딩
+          features: { enableAutomaticPunctuation: true },
+          ...(hints.length
+            ? { adaptation: { phraseSets: [{ phrases: hints.map(v => ({ value: v })), boost: 20.0 }] } }
+            : {}),
         },
         content: wavB64,
-      });
-      transcript = (resp.results || []).map(r => r.alternatives?.[0]?.transcript || "")
-        .join(" ").trim();
+      };
+      const [resp] = await sttV2.recognize(v2req);
+      transcript = (resp.results || [])
+        .map((r) => r.alternatives?.[0]?.transcript || "")
+        .join(" ")
+        .trim();
     } catch (e) {
-      console.error("[v2 failed -> fallback v1]", e?.message || e);
-      // v1 폴백
-      const [resp1] = await sttV1.recognize({
-        config: {
-          languageCode: lang,
-          enableAutomaticPunctuation: true,
-          speechContexts: hints.length ? [{ phrases: hints }] : [],
-        },
-        audio: { content: wavB64 },
-      });
-      transcript = (resp1.results || []).map(r => r.alternatives?.[0]?.transcript || "")
-        .join(" ").trim();
+      console.error("[v2 failed]", e?.message || e);
+
+      // v1 폴백은 기본 비활성화(환경변수로 제어)
+      const USE_V1_FALLBACK = env("USE_V1_FALLBACK", "0") === "1";
+      if (USE_V1_FALLBACK) {
+        try {
+          const v1req = {
+            config: {
+              languageCode: langForHints, // v1은 언어가 필요
+              enableAutomaticPunctuation: true,
+              ...(hints.length ? { speechContexts: [{ phrases: hints }] } : {}), // 빈 배열 금지
+            },
+            audio: { content: wavB64 },
+          };
+          const [resp1] = await sttV1.recognize(v1req);
+          transcript = (resp1.results || [])
+            .map((r) => r.alternatives?.[0]?.transcript || "")
+            .join(" ")
+            .trim();
+        } catch (e1) {
+          console.error("[v1 fallback failed]", e1?.message || e1);
+          throw e1; // 최종 에러로 처리
+        }
+      }
     }
 
-    // 5) 스코어링 (타깃이 없어도 자유발화용으로 안전)
+    // 5) 스코어링 (타깃 없어도 안전)
     const scoring = scoreAttempt({ transcript, targetText: target });
 
     // 6) (옵션) 임베딩 유사도 — 6초 제한, 실패 시 스킵
@@ -145,10 +178,13 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
     if (wantSemantic && target && transcript) {
       try {
         const embedder = vertex.getEmbeddingsModel({ model: "text-embedding-004" });
-        const [refE, hypE] = await withTimeout(Promise.all([
-          embedder.embedContent({ content: { parts: [{ text: target }] } }),
-          embedder.embedContent({ content: { parts: [{ text: transcript }] } }),
-        ]), 6000);
+        const [refE, hypE] = await withTimeout(
+          Promise.all([
+            embedder.embedContent({ content: { parts: [{ text: target }] } }),
+            embedder.embedContent({ content: { parts: [{ text: transcript }] } }),
+          ]),
+          6000
+        );
         const a = refE.embeddings[0].values;
         const b = hypE.embeddings[0].values;
         const dot = a.reduce((s, v, i) => s + v * b[i], 0);
@@ -157,7 +193,7 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
         const cos = dot / (na * nb);
         semantic = Math.round(Math.max(0, Math.min(1, cos)) * 100);
       } catch (err) {
-        console.error("[embedding skipped]", err.message || err);
+        console.error("[embedding skipped]", err?.message || err);
       }
     }
 
@@ -165,14 +201,14 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
     let aiFeedback = null;
     if (wantCoach) {
       try {
-        const gen = vertex.getGenerativeModel({ model: "gemini-1.5-flash" });
+        const gen = vertex.getGenerativeModel({ model: GEMINI_MODEL });
         const prompt = `You are an ESL speaking coach.
 Return a compact JSON object with these keys only:
 - concise_feedback: array(max 3 bullets)
 - grammar_fixes: array of 3 short objects {before, after}
 - pronunciation_tips: array(max 2)
 - next_prompt: one short line
-Language for the user-facing text: ${lang}
+Language for the user-facing text: ${langForHints}
 Reference: """${target}"""
 Transcript: """${transcript}"""`;
 
@@ -181,10 +217,13 @@ Transcript: """${transcript}"""`;
           6000
         );
         const text = r.response?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
-        try { aiFeedback = JSON.parse(text); }
-        catch { aiFeedback = { raw: text }; }
+        try {
+          aiFeedback = JSON.parse(text);
+        } catch {
+          aiFeedback = { raw: text };
+        }
       } catch (err) {
-        console.error("[gemini skipped]", err.message || err);
+        console.error("[gemini skipped]", err?.message || err);
       }
     }
 
