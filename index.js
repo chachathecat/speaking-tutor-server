@@ -1,11 +1,4 @@
-// index.js (fixed)
-//
-// ✅ 핵심 수정
-// 1) STT v2 요청 형식 정리: autoDecodingConfig/feature만 사용(언어/모델은 Recognizer가 보유)
-// 2) v1 폴백은 기본 OFF. 켜더라도 phraseHints가 있을 때만 붙이도록 방어
-// 3) Vertex AI 리전/모델 환경변수화(기본 us-central1, gemini-1.5-flash-001) + 에러시 조용히 스킵
-// 4) ffmpeg, 파일정리, 타임아웃 그대로 유지
-
+import { WebSocketServer } from "ws";
 import express from "express";
 import cors from "cors";
 import multer from "multer";
