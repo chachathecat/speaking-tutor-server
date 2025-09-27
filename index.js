@@ -20,15 +20,15 @@ import { VertexAI } from "@google-cloud/vertexai";
 if (ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
 
 // ---------- Vertex AI
+// ※ 모델 가용성 때문에 us-central1을 권장 (Speech는 기존 리전 유지 가능)
 const vertex = new VertexAI({
   project: process.env.GCP_PROJECT_ID,
-  location: process.env.GCP_LOCATION,
+  location: "us-central1",
 });
 
 // ---------- Speech-to-Text
-const sttV2 = new speechV2.SpeechClient(); // v2 고정
-// v1 폴백용은 실패했을 때 new 해도 되지만, 한 번만 만들어 재사용
-const sttV1 = new speechV1.SpeechClient();
+const sttV2 = new speechV2.SpeechClient(); // v2 우선
+const sttV1 = new speechV1.SpeechClient(); // v1 폴백
 
 // ---------- Express 기본
 const app = express();
@@ -120,7 +120,7 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
             ? { phraseSets: [{ phrases: hints.map(v => ({ value: v })), boost: 20.0 }] }
             : undefined,
         },
-        content: wavB64, // v2는 content 필드 (RecognitionAudio 아님)
+        content: wavB64, // v2 형식
       });
 
       transcript = (resp.results || [])
@@ -132,14 +132,14 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
       console.error("[v2 failed -> fallback v1]", e?.message || e);
 
       // ---- v1 (폴백) ----
-      // v1은 recognizer가 없고, audio:{content} + speechContexts 사용
       const [resp1] = await sttV1.recognize({
         config: {
           languageCode: lang,
           enableAutomaticPunctuation: true,
-          speechContexts: hints.length ? [{ phrases: hints, boost: 20.0 }] : [],
+          // v1은 speechContexts 사용 (boost는 무시될 수 있음)
+          speechContexts: hints.length ? [{ phrases: hints }] : [],
         },
-        audio: { content: wavB64 }, // v1형식: RecognitionAudio
+        audio: { content: wavB64 }, // v1 형식
       });
 
       transcript = (resp1.results || [])
@@ -151,28 +151,32 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
     // 5) 스코어링
     const scoring = scoreAttempt({ transcript, targetText: target });
 
-    // 6) (옵션) 임베딩 유사도
+    // 6) (옵션) 임베딩 유사도 — Vertex (us-central1)
     let semantic = null;
     if (wantSemantic && target && transcript) {
       try {
-        const embed = vertex.getEmbeddingsModel({ model: "text-embedding-004" });
+        const embedder = vertex.getTextEmbeddingModel({ model: "text-embedding-004" });
         const [refE, hypE] = await Promise.all([
-          embed.embedContent({ content: { parts: [{ text: target }] } }),
-          embed.embedContent({ content: { parts: [{ text: transcript }] } }),
+          embedder.embedContent({ content: { parts: [{ text: target }] } }),
+          embedder.embedContent({ content: { parts: [{ text: transcript }] } }),
         ]);
         const a = refE.embeddings[0].values;
         const b = hypE.embeddings[0].values;
-        semantic = Math.round(Math.max(0, Math.min(1, cosine(a, b))) * 100);
+        const dot = a.reduce((s, v, i) => s + v * b[i], 0);
+        const na = Math.sqrt(a.reduce((s, v) => s + v * v, 0));
+        const nb = Math.sqrt(b.reduce((s, v) => s + v * v, 0));
+        const cos = dot / (na * nb);
+        semantic = Math.round(Math.max(0, Math.min(1, cos)) * 100);
       } catch (err) {
         console.error("[embedding]", err);
       }
     }
 
-    // 7) (옵션) Gemini 코칭
+    // 7) (옵션) Gemini 코칭 — 가용 모델로 교체
     let aiFeedback = null;
     if (wantCoach) {
       try {
-        const gen = vertex.getGenerativeModel({ model: "gemini-2.0-flash" });
+        const gen = vertex.getGenerativeModel({ model: "gemini-1.5-flash" });
         const prompt = `You are an ESL speaking coach.
 Return a compact JSON object with these keys only:
 - concise_feedback: array(max 3 bullets)
@@ -187,7 +191,8 @@ Transcript: """${transcript}"""`;
           contents: [{ role: "user", parts: [{ text: prompt }] }],
         });
         const text = r.response?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
-        try { aiFeedback = JSON.parse(text); } catch { aiFeedback = { raw: text }; }
+        try { aiFeedback = JSON.parse(text); }
+        catch { aiFeedback = { raw: text }; }
       } catch (err) {
         console.error("[gemini]", err);
       }
