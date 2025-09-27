@@ -13,7 +13,6 @@ import { randomUUID } from "crypto";
 
 import { v2 as speechV2, v1 as speechV1 } from "@google-cloud/speech";
 import { scoreAttempt } from "./score.js";
-
 import { VertexAI } from "@google-cloud/vertexai";
 
 // ---------- FFmpeg (Render 등에서 필수)
@@ -56,6 +55,25 @@ function toLinear16(inputPath, outPath) {
       .on("error", reject)
       .save(outPath);
   });
+}
+
+// ---------- v2 Adaptation 헬퍼 (핵심 수정)
+function buildAdaptation(hints) {
+  const cleanHints = Array.isArray(hints)
+    ? [...new Set(hints.map(s => String(s).trim()).filter(Boolean))].slice(0, 5)
+    : [];
+  if (!cleanHints.length) return undefined; // 비어있으면 아예 빼기
+
+  return {
+    phraseSets: [
+      {
+        phraseSet: {
+          phrases: cleanHints.map(v => ({ value: v })),
+        },
+        boost: 20.0,
+      },
+    ],
+  };
 }
 
 app.get("/", (_, res) => res.send("OK speaking tutor server"));
@@ -123,11 +141,9 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
       const v2req = {
         recognizer,
         config: {
-          autoDecodingConfig: {}, // 자동 디코딩
+          autoDecodingConfig: {},
           features: { enableAutomaticPunctuation: true },
-          ...(hints.length
-            ? { adaptation: { phraseSets: [{ phrases: hints.map(v => ({ value: v })), boost: 20.0 }] } }
-            : {}),
+          adaptation: buildAdaptation(hints), // ← 핵심
         },
         content: wavB64,
       };
@@ -145,9 +161,9 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
         try {
           const v1req = {
             config: {
-              languageCode: langForHints, // v1은 언어가 필요
+              languageCode: langForHints,
               enableAutomaticPunctuation: true,
-              ...(hints.length ? { speechContexts: [{ phrases: hints }] } : {}), // 빈 배열 금지
+              ...(hints.length ? { speechContexts: [{ phrases: hints }] } : {}),
             },
             audio: { content: wavB64 },
           };
@@ -158,7 +174,7 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
             .trim();
         } catch (e1) {
           console.error("[v1 fallback failed]", e1?.message || e1);
-          throw e1; // 최종 에러로 처리
+          throw e1;
         }
       }
     }
@@ -246,7 +262,7 @@ async function transcribeBase64Wav(wavB64, hints = []) {
     config: {
       autoDecodingConfig: {},
       features: { enableAutomaticPunctuation: true },
-      ...(hints.length ? { adaptation: { phraseSets: [{ phrases: hints.map(v => ({ value: v })), boost: 20.0 }] } } : {}),
+      adaptation: buildAdaptation(hints), // ← 핵심
     },
     content: wavB64,
   };
@@ -280,7 +296,9 @@ wss.on("connection", (ws) => {
         lastPartial = text;
         ws.send(JSON.stringify({ type: "partial", text }));
       }
-    } catch {}
+    } catch {
+      // 부분 인식 실패는 조용히 스킵
+    }
   };
 
   // 2초마다 부분 인식
