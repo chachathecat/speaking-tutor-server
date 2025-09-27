@@ -1,4 +1,3 @@
-// index.js
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -19,16 +18,15 @@ import { VertexAI } from "@google-cloud/vertexai";
 // ---------- FFmpeg (Render 등에서 필수)
 if (ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
 
-// ---------- Vertex AI
-// ※ 모델 가용성 때문에 us-central1을 권장 (Speech는 기존 리전 유지 가능)
+// ---------- Vertex AI  (us-central1 권장)
 const vertex = new VertexAI({
   project: process.env.GCP_PROJECT_ID,
   location: "us-central1",
 });
 
 // ---------- Speech-to-Text
-const sttV2 = new speechV2.SpeechClient(); // v2 우선
-const sttV1 = new speechV1.SpeechClient(); // v1 폴백
+const sttV2 = new speechV2.SpeechClient();
+const sttV1 = new speechV1.SpeechClient();
 
 // ---------- Express 기본
 const app = express();
@@ -58,12 +56,12 @@ function toLinear16(inputPath, outPath) {
 app.get("/", (_, res) => res.send("OK speaking tutor server"));
 app.get("/healthz", (_, res) => res.json({ ok: true }));
 
-function cosine(a, b) {
-  const dot = a.reduce((s, v, i) => s + v * b[i], 0);
-  const na = Math.sqrt(a.reduce((s, v) => s + v * v, 0));
-  const nb = Math.sqrt(b.reduce((s, v) => s + v * v, 0));
-  return dot / (na * nb);
-}
+// ---- 작은 유틸: 타임아웃 래퍼
+const withTimeout = (p, ms) =>
+  Promise.race([
+    p,
+    new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms)),
+  ]);
 
 app.post("/stt/score", upload.single("audio"), async (req, res) => {
   let inPath, outPath;
@@ -110,7 +108,7 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
     let transcript = "";
 
     try {
-      // ---- v2 (권장) ----
+      // v2 (권장)
       const [resp] = await sttV2.recognize({
         recognizer,
         config: {
@@ -120,46 +118,37 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
             ? { phraseSets: [{ phrases: hints.map(v => ({ value: v })), boost: 20.0 }] }
             : undefined,
         },
-        content: wavB64, // v2 형식
+        content: wavB64,
       });
-
-      transcript = (resp.results || [])
-        .map(r => r.alternatives?.[0]?.transcript || "")
-        .join(" ")
-        .trim();
-
+      transcript = (resp.results || []).map(r => r.alternatives?.[0]?.transcript || "")
+        .join(" ").trim();
     } catch (e) {
       console.error("[v2 failed -> fallback v1]", e?.message || e);
-
-      // ---- v1 (폴백) ----
+      // v1 폴백
       const [resp1] = await sttV1.recognize({
         config: {
           languageCode: lang,
           enableAutomaticPunctuation: true,
-          // v1은 speechContexts 사용 (boost는 무시될 수 있음)
           speechContexts: hints.length ? [{ phrases: hints }] : [],
         },
-        audio: { content: wavB64 }, // v1 형식
+        audio: { content: wavB64 },
       });
-
-      transcript = (resp1.results || [])
-        .map(r => r.alternatives?.[0]?.transcript || "")
-        .join(" ")
-        .trim();
+      transcript = (resp1.results || []).map(r => r.alternatives?.[0]?.transcript || "")
+        .join(" ").trim();
     }
 
-    // 5) 스코어링
+    // 5) 스코어링 (타깃이 없어도 자유발화용으로 안전)
     const scoring = scoreAttempt({ transcript, targetText: target });
 
-    // 6) (옵션) 임베딩 유사도 — Vertex (us-central1)
+    // 6) (옵션) 임베딩 유사도 — 6초 제한, 실패 시 스킵
     let semantic = null;
     if (wantSemantic && target && transcript) {
       try {
-        const embedder = vertex.getTextEmbeddingModel({ model: "text-embedding-004" });
-        const [refE, hypE] = await Promise.all([
+        const embedder = vertex.getEmbeddingsModel({ model: "text-embedding-004" });
+        const [refE, hypE] = await withTimeout(Promise.all([
           embedder.embedContent({ content: { parts: [{ text: target }] } }),
           embedder.embedContent({ content: { parts: [{ text: transcript }] } }),
-        ]);
+        ]), 6000);
         const a = refE.embeddings[0].values;
         const b = hypE.embeddings[0].values;
         const dot = a.reduce((s, v, i) => s + v * b[i], 0);
@@ -168,11 +157,11 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
         const cos = dot / (na * nb);
         semantic = Math.round(Math.max(0, Math.min(1, cos)) * 100);
       } catch (err) {
-        console.error("[embedding]", err);
+        console.error("[embedding skipped]", err.message || err);
       }
     }
 
-    // 7) (옵션) Gemini 코칭 — 가용 모델로 교체
+    // 7) (옵션) Gemini 코칭 — 6초 제한, 실패 시 스킵
     let aiFeedback = null;
     if (wantCoach) {
       try {
@@ -187,14 +176,15 @@ Language for the user-facing text: ${lang}
 Reference: """${target}"""
 Transcript: """${transcript}"""`;
 
-        const r = await gen.generateContent({
-          contents: [{ role: "user", parts: [{ text: prompt }] }],
-        });
+        const r = await withTimeout(
+          gen.generateContent({ contents: [{ role: "user", parts: [{ text: prompt }] }] }),
+          6000
+        );
         const text = r.response?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
         try { aiFeedback = JSON.parse(text); }
         catch { aiFeedback = { raw: text }; }
       } catch (err) {
-        console.error("[gemini]", err);
+        console.error("[gemini skipped]", err.message || err);
       }
     }
 
