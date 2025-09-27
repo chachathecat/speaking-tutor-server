@@ -1,3 +1,4 @@
+// server.js
 import { WebSocketServer } from "ws";
 import express from "express";
 import cors from "cors";
@@ -12,25 +13,33 @@ import path from "path";
 import { randomUUID } from "crypto";
 
 import { v2 as speechV2, v1 as speechV1 } from "@google-cloud/speech";
+import textToSpeech from "@google-cloud/text-to-speech";
 import { scoreAttempt } from "./score.js";
+
 import { VertexAI } from "@google-cloud/vertexai";
 
 // ---------- FFmpeg (Render 등에서 필수)
 if (ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
 
-// ---------- Env helpers
-const env = (k, d) => (process.env[k] ?? d);
+// ---------- Env helpers (과거/현재 키 병행 지원)
+const envAny = (keys, d = "") => {
+  for (const k of keys) if (process.env[k] != null) return process.env[k];
+  return d;
+};
 
-// ---------- Vertex AI (us-central1 권장)
-const vertex = new VertexAI({
-  project: env("GCP_PROJECT_ID", ""),
-  location: env("GEMINI_LOCATION", "us-central1"),
-});
-const GEMINI_MODEL = env("GEMINI_MODEL", "gemini-1.5-flash-001");
+// 통일된 키 (이름은 GOOGLE_* 기본, 예전 GCP_*도 허용)
+const PROJECT_ID = envAny(["GOOGLE_PROJECT_ID", "GCP_PROJECT_ID"], "");
+const LOCATION   = envAny(["GOOGLE_LOCATION", "GEMINI_LOCATION", "GCP_LOCATION"], "us-central1");
+const RECOGNIZER_ID = envAny(["GOOGLE_RECOGNIZER_ID", "GCP_RECOGNIZER_ID"], "");
+const GEMINI_MODEL  = envAny(["GEMINI_MODEL"], "publishers/google/models/gemini-1.5-flash");
 
-// ---------- Speech-to-Text
+// ---------- Vertex AI
+const vertex = new VertexAI({ project: PROJECT_ID, location: LOCATION });
+
+// ---------- Speech / TTS
 const sttV2 = new speechV2.SpeechClient();
 const sttV1 = new speechV1.SpeechClient();
+const tts = new textToSpeech.TextToSpeechClient();
 
 // ---------- Express 기본
 const app = express();
@@ -57,25 +66,6 @@ function toLinear16(inputPath, outPath) {
   });
 }
 
-// ---------- v2 Adaptation 헬퍼 (핵심 수정)
-function buildAdaptation(hints) {
-  const cleanHints = Array.isArray(hints)
-    ? [...new Set(hints.map(s => String(s).trim()).filter(Boolean))].slice(0, 5)
-    : [];
-  if (!cleanHints.length) return undefined; // 비어있으면 아예 빼기
-
-  return {
-    phraseSets: [
-      {
-        phraseSet: {
-          phrases: cleanHints.map(v => ({ value: v })),
-        },
-        boost: 20.0,
-      },
-    ],
-  };
-}
-
 app.get("/", (_, res) => res.send("OK speaking tutor server"));
 app.get("/healthz", (_, res) => res.json({ ok: true }));
 
@@ -86,6 +76,51 @@ const withTimeout = (p, ms) =>
     new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms)),
   ]);
 
+// ---- TTS
+function pickVoice(lang = "en-US") {
+  // 필요하면 더 추가
+  if (lang.startsWith("ko")) return { languageCode: "ko-KR", name: "ko-KR-Neural2-A" };
+  if (lang.startsWith("ja")) return { languageCode: "ja-JP", name: "ja-JP-Neural2-B" };
+  if (lang.startsWith("zh")) return { languageCode: "cmn-CN", name: "cmn-CN-Wavenet-A" };
+  return { languageCode: "en-US", name: "en-US-Neural2-C" };
+}
+async function synth(text, lang = "en-US") {
+  if (!text) return "";
+  const voice = pickVoice(lang);
+  const [res] = await tts.synthesizeSpeech({
+    input: { text },
+    voice,
+    audioConfig: { audioEncoding: "MP3", speakingRate: 1.0 },
+  });
+  return res.audioContent?.toString("base64") ?? "";
+}
+
+// ---- STT v2 공용 호출
+async function sttV2RecognizeBase64(wavB64, hints = [], recognizerOverride) {
+  const recognizerPath =
+    recognizerOverride ||
+    `projects/${PROJECT_ID}/locations/${LOCATION}/recognizers/${RECOGNIZER_ID}`;
+
+  const v2req = {
+    recognizer: recognizerPath,
+    config: {
+      autoDecodingConfig: {},
+      features: { enableAutomaticPunctuation: true },
+      ...(hints?.length
+        ? { adaptation: { phraseSets: [{ phrases: hints.map(v => ({ value: v })), boost: 20.0 }] } }
+        : {}),
+    },
+    content: wavB64,
+  };
+  const [resp] = await sttV2.recognize(v2req);
+  const text = (resp.results || [])
+    .map((r) => r.alternatives?.[0]?.transcript || "")
+    .join(" ")
+    .trim();
+  return text;
+}
+
+// ── 메인 REST 엔드포인트 ──────────────────────────────────
 app.post("/stt/score", upload.single("audio"), async (req, res) => {
   let inPath, outPath;
   try {
@@ -95,7 +130,7 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
 
     // 1) 입력 파라미터
     const target = req.body?.target || "";
-    // v2에서는 Recognizer가 언어를 가짐. lang은 코칭 텍스트 언어용으로만 활용
+    // v2에서는 Recognizer가 언어를 가짐. lang은 코칭/음성언어용으로 활용
     const langForHints = req.body?.lang || "en-US";
 
     let hints = [];
@@ -107,6 +142,7 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
     }
     const wantSemantic = req.body?.semantic === "1";
     const wantCoach = req.body?.coach === "1";
+    const wantTTS = req.body?.tts === "1"; // ← 응답 음성 포함 여부
 
     // 2) 임시 파일
     const mt = (req.file.mimetype || "").toLowerCase();
@@ -130,33 +166,15 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
     }
     const wavB64 = wavBytes.toString("base64");
 
-    // 4) STT 호출: v2 → (옵션) v1 폴백
-    const recognizer =
-      `projects/${env("GCP_PROJECT_ID", "")}/locations/${env("GCP_LOCATION", "global")}/recognizers/${env("GCP_RECOGNIZER_ID", "")}`;
-
+    // 4) STT: v2 → (옵션) v1 폴백
+    const recognizerPath = `projects/${PROJECT_ID}/locations/${LOCATION}/recognizers/${RECOGNIZER_ID}`;
     let transcript = "";
 
     try {
-      // v2 (권장) — 언어/모델은 Recognizer 설정에 따름
-      const v2req = {
-        recognizer,
-        config: {
-          autoDecodingConfig: {},
-          features: { enableAutomaticPunctuation: true },
-          adaptation: buildAdaptation(hints), // ← 핵심
-        },
-        content: wavB64,
-      };
-      const [resp] = await sttV2.recognize(v2req);
-      transcript = (resp.results || [])
-        .map((r) => r.alternatives?.[0]?.transcript || "")
-        .join(" ")
-        .trim();
+      transcript = await sttV2RecognizeBase64(wavB64, hints, recognizerPath);
     } catch (e) {
       console.error("[v2 failed]", e?.message || e);
-
-      // v1 폴백은 기본 비활성화(환경변수로 제어)
-      const USE_V1_FALLBACK = env("USE_V1_FALLBACK", "0") === "1";
+      const USE_V1_FALLBACK = envAny(["USE_V1_FALLBACK"], "0") === "1";
       if (USE_V1_FALLBACK) {
         try {
           const v1req = {
@@ -174,15 +192,17 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
             .trim();
         } catch (e1) {
           console.error("[v1 fallback failed]", e1?.message || e1);
-          throw e1;
+          throw e1; // 최종 에러
         }
+      } else {
+        throw e; // 폴백 비활성 시 에러 그대로
       }
     }
 
-    // 5) 스코어링 (타깃 없어도 안전)
+    // 5) 스코어링
     const scoring = scoreAttempt({ transcript, targetText: target });
 
-    // 6) (옵션) 임베딩 유사도 — 6초 제한, 실패 시 스킵
+    // 6) 시맨틱(임베딩) — 6초 제한, 실패 시 스킵
     let semantic = null;
     if (wantSemantic && target && transcript) {
       try {
@@ -199,17 +219,17 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
         const dot = a.reduce((s, v, i) => s + v * b[i], 0);
         const na = Math.sqrt(a.reduce((s, v) => s + v * v, 0));
         const nb = Math.sqrt(b.reduce((s, v) => s + v * v, 0));
-        const cos = dot / (na * nb);
-        semantic = Math.round(Math.max(0, Math.min(1, cos)) * 100);
+        const cos = dot / (na * nb);                    // -1..1
+        semantic = Math.round(((cos + 1) / 2) * 100);   // 0..100
       } catch (err) {
         console.error("[embedding skipped]", err?.message || err);
       }
     }
 
-    // 7) (옵션) Gemini 코칭 — 6초 제한, 실패 시 스킵
+    // 7) Gemini 코칭(JSON 강제) — 6초 제한, 실패 시 스킵
     let aiFeedback = null;
-    if (wantCoach) {
-      try {
+    try {
+      if (wantCoach) {
         const gen = vertex.getGenerativeModel({ model: GEMINI_MODEL });
         const prompt = `You are an ESL speaking coach.
 Return a compact JSON object with these keys only:
@@ -222,22 +242,35 @@ Reference: """${target}"""
 Transcript: """${transcript}"""`;
 
         const r = await withTimeout(
-          gen.generateContent({ contents: [{ role: "user", parts: [{ text: prompt }] }] }),
+          gen.generateContent({
+            contents: [{ role: "user", parts: [{ text: prompt }] }],
+            generationConfig: { responseMimeType: "application/json" },
+          }),
           6000
         );
         const text = r.response?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
-        try {
-          aiFeedback = JSON.parse(text);
-        } catch {
-          aiFeedback = { raw: text };
-        }
-      } catch (err) {
-        console.error("[gemini skipped]", err?.message || err);
+        aiFeedback = JSON.parse(text);
+      }
+    } catch (err) {
+      console.error("[gemini skipped]", err?.message || err);
+      aiFeedback = null;
+    }
+
+    // 8) (옵션) TTS로 코치 발화 준비
+    let coachSpeechB64 = "";
+    const speakLine =
+      aiFeedback?.next_prompt ||
+      (transcript ? "Good job. Tell me more." : "Hello! What would you like to practice?");
+    if (wantTTS) {
+      try {
+        coachSpeechB64 = await synth(speakLine, langForHints);
+      } catch (e) {
+        console.error("[tts failed]", e?.message || e);
       }
     }
 
-    // 8) 응답
-    res.json({ ok: true, transcript, scoring, semantic, aiFeedback });
+    // 9) 응답
+    res.json({ ok: true, transcript, scoring, semantic, aiFeedback, coachSpeechB64, speakLine });
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok: false, error: String(e) });
@@ -253,36 +286,24 @@ const server = app.listen(PORT, () => console.log("Server on " + PORT));
 // ── WS 스트리밍 (pseudo-live) ──────────────────────────────
 const wss = new WebSocketServer({ server, path: "/stt/stream" });
 
-// 공용: base64 WAV 를 받아 STT v2로 돌리는 함수
-async function transcribeBase64Wav(wavB64, hints = []) {
-  const recognizer =
-    `projects/${process.env.GCP_PROJECT_ID}/locations/${process.env.GCP_LOCATION || "global"}/recognizers/${process.env.GCP_RECOGNIZER_ID}`;
-  const v2req = {
-    recognizer,
-    config: {
-      autoDecodingConfig: {},
-      features: { enableAutomaticPunctuation: true },
-      adaptation: buildAdaptation(hints), // ← 핵심
-    },
-    content: wavB64,
-  };
-  const [resp] = await sttV2.recognize(v2req);
-  const text = (resp.results || []).map(r => r.alternatives?.[0]?.transcript || "").join(" ").trim();
-  return text;
-}
+// 공용: base64 WAV 를 받아 STT v2로 돌리는 함수 (위에 정의됨)
+// async function sttV2RecognizeBase64(...)
 
-// 녹음 조각을 모아두는 버퍼
 wss.on("connection", (ws) => {
   ws.send(JSON.stringify({ type: "ready" }));
 
   let chunks = [];            // Uint8Array[]
   let timer = null;
   let lastPartial = "";
+  let flushing = false;       // 동시 실행 방지
+  let totalBytes = 0;
+  const MAX_BYTES = 8 * 1024 * 1024; // 8MB 이상이면 오래된 조각 버림
 
   const flushPartial = async () => {
+    if (flushing) return;
+    flushing = true;
     try {
       if (!chunks.length) return;
-      // 임시 파일로 저장 → WAV 변환 → base64
       const inPath = path.join(tmpdir(), `${randomUUID()}.webm`);
       const outPath = path.join(tmpdir(), `${randomUUID()}.wav`);
       const buf = Buffer.concat(chunks);
@@ -291,13 +312,15 @@ wss.on("connection", (ws) => {
       const wavB64 = (await fs.readFile(outPath)).toString("base64");
       await Promise.allSettled([fs.unlink(inPath), fs.unlink(outPath)]);
 
-      const text = await transcribeBase64Wav(wavB64);
+      const text = await sttV2RecognizeBase64(wavB64, []);
       if (text && text !== lastPartial) {
         lastPartial = text;
         ws.send(JSON.stringify({ type: "partial", text }));
       }
-    } catch {
-      // 부분 인식 실패는 조용히 스킵
+    } catch (e) {
+      // 부분 인식 에러는 조용히 스킵
+    } finally {
+      flushing = false;
     }
   };
 
@@ -305,7 +328,16 @@ wss.on("connection", (ws) => {
   timer = setInterval(flushPartial, 2000);
 
   ws.on("message", async (data, isBinary) => {
-    if (isBinary) { chunks.push(Buffer.from(data)); return; }
+    if (isBinary) {
+      const b = Buffer.from(data);
+      chunks.push(b);
+      totalBytes += b.length;
+      while (totalBytes > MAX_BYTES && chunks.length > 1) {
+        totalBytes -= chunks[0].length;
+        chunks.shift(); // 오래된 조각 제거
+      }
+      return;
+    }
     const msg = data.toString();
     if (msg === "stop") {
       clearInterval(timer);
@@ -320,7 +352,7 @@ wss.on("connection", (ws) => {
           const wavB64 = (await fs.readFile(outPath)).toString("base64");
           await Promise.allSettled([fs.unlink(inPath), fs.unlink(outPath)]);
 
-          const finalText = await transcribeBase64Wav(wavB64);
+          const finalText = await sttV2RecognizeBase64(wavB64, []);
           ws.send(JSON.stringify({ type: "final", text: finalText }));
         } else {
           ws.send(JSON.stringify({ type: "final", text: "" }));
@@ -330,6 +362,7 @@ wss.on("connection", (ws) => {
       } finally {
         chunks = [];
         lastPartial = "";
+        totalBytes = 0;
       }
     }
   });
