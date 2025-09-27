@@ -1,4 +1,3 @@
-import { WebSocketServer } from "ws";
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -232,4 +231,4 @@ Transcript: """${transcript}"""`;
 });
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log("Server on " + PORT));
+const server = app.listen(PORT, () => console.log("Server on " + PORT));
