@@ -1,3 +1,4 @@
+import { WebSocketServer } from "ws";
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -232,3 +233,90 @@ Transcript: """${transcript}"""`;
 
 const PORT = process.env.PORT || 8080;
 const server = app.listen(PORT, () => console.log("Server on " + PORT));
+
+// ── WS 스트리밍 (pseudo-live) ──────────────────────────────
+const wss = new WebSocketServer({ server, path: "/stt/stream" });
+
+// 공용: base64 WAV 를 받아 STT v2로 돌리는 함수
+async function transcribeBase64Wav(wavB64, hints = []) {
+  const recognizer =
+    `projects/${process.env.GCP_PROJECT_ID}/locations/${process.env.GCP_LOCATION || "global"}/recognizers/${process.env.GCP_RECOGNIZER_ID}`;
+  const v2req = {
+    recognizer,
+    config: {
+      autoDecodingConfig: {},
+      features: { enableAutomaticPunctuation: true },
+      ...(hints.length ? { adaptation: { phraseSets: [{ phrases: hints.map(v => ({ value: v })), boost: 20.0 }] } } : {}),
+    },
+    content: wavB64,
+  };
+  const [resp] = await sttV2.recognize(v2req);
+  const text = (resp.results || []).map(r => r.alternatives?.[0]?.transcript || "").join(" ").trim();
+  return text;
+}
+
+// 녹음 조각을 모아두는 버퍼
+wss.on("connection", (ws) => {
+  ws.send(JSON.stringify({ type: "ready" }));
+
+  let chunks = [];            // Uint8Array[]
+  let timer = null;
+  let lastPartial = "";
+
+  const flushPartial = async () => {
+    try {
+      if (!chunks.length) return;
+      // 임시 파일로 저장 → WAV 변환 → base64
+      const inPath = path.join(tmpdir(), `${randomUUID()}.webm`);
+      const outPath = path.join(tmpdir(), `${randomUUID()}.wav`);
+      const buf = Buffer.concat(chunks);
+      await fs.writeFile(inPath, buf);
+      await toLinear16(inPath, outPath);
+      const wavB64 = (await fs.readFile(outPath)).toString("base64");
+      await Promise.allSettled([fs.unlink(inPath), fs.unlink(outPath)]);
+
+      const text = await transcribeBase64Wav(wavB64);
+      if (text && text !== lastPartial) {
+        lastPartial = text;
+        ws.send(JSON.stringify({ type: "partial", text }));
+      }
+    } catch {}
+  };
+
+  // 2초마다 부분 인식
+  timer = setInterval(flushPartial, 2000);
+
+  ws.on("message", async (data, isBinary) => {
+    if (isBinary) { chunks.push(Buffer.from(data)); return; }
+    const msg = data.toString();
+    if (msg === "stop") {
+      clearInterval(timer);
+      try {
+        await flushPartial(); // 마지막 부분
+        if (chunks.length) {
+          const inPath = path.join(tmpdir(), `${randomUUID()}.webm`);
+          const outPath = path.join(tmpdir(), `${randomUUID()}.wav`);
+          const buf = Buffer.concat(chunks);
+          await fs.writeFile(inPath, buf);
+          await toLinear16(inPath, outPath);
+          const wavB64 = (await fs.readFile(outPath)).toString("base64");
+          await Promise.allSettled([fs.unlink(inPath), fs.unlink(outPath)]);
+
+          const finalText = await transcribeBase64Wav(wavB64);
+          ws.send(JSON.stringify({ type: "final", text: finalText }));
+        } else {
+          ws.send(JSON.stringify({ type: "final", text: "" }));
+        }
+      } catch (e) {
+        ws.send(JSON.stringify({ type: "error", error: e?.message || String(e) }));
+      } finally {
+        chunks = [];
+        lastPartial = "";
+      }
+    }
+  });
+
+  ws.on("close", () => {
+    clearInterval(timer);
+  });
+});
