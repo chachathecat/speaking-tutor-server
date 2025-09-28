@@ -1,4 +1,3 @@
-// server.js
 import { WebSocketServer } from "ws";
 import express from "express";
 import cors from "cors";
@@ -46,6 +45,54 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.options("*", cors());
+// --- 대화 세션 메모리 (간단히 보관)
+const sessions = new Map();
+function pushHistory(sid, role, text) {
+  if (!sessions.has(sid)) sessions.set(sid, []);
+  const hist = sessions.get(sid);
+  hist.push({ role, text });
+  if (hist.length > 12) hist.splice(0, hist.length - 12); // 최근 12턴만 유지
+  return hist;
+}
+
+// --- 대화 응답 API
+app.post("/chat/reply", async (req, res) => {
+  const {
+    sessionId = randomUUID(),
+    userText = "",
+    level = "B1",
+    topic = "Free talk",
+    lang = "en-US"
+  } = req.body || {};
+
+  try {
+    if (userText) pushHistory(sessionId, "user", userText);
+
+    // Vertex 초기화·환경변수는 네 코드 그대로 사용
+    const gen = vertex.getGenerativeModel({ model: GEMINI_MODEL });
+    const system = `You are an upbeat ESL speaking tutor.
+- Keep turns short (max 2 sentences).
+- Ask ONE question each turn and drive the conversation.
+- Topic: ${topic}, CEFR level: ${level}.
+- Speak ${lang}. If the learner struggles, simplify.`;
+
+    const history = (sessions.get(sessionId) || [])
+      .flatMap(m => [{ role: m.role, parts: [{ text: m.text }]}]);
+
+    const r = await gen.generateContent({
+      contents: [{ role: "user", parts: [{ text: system }] }, ...history]
+    });
+
+    const text =
+      r.response?.candidates?.[0]?.content?.parts?.[0]?.text?.trim()
+      || "Let's keep going!";
+
+    pushHistory(sessionId, "assistant", text);
+    res.json({ ok: true, sessionId, text });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
 
 // 업로드는 메모리 저장 (buffer 사용)
 const upload = multer({
