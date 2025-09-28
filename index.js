@@ -1,3 +1,4 @@
+// index.js
 import { WebSocketServer } from "ws";
 import express from "express";
 import cors from "cors";
@@ -373,7 +374,7 @@ wss.on("connection", (ws) => {
   };
 
   // 2초마다 부분 인식
-  timer = setInterval(flushPartial, 2000);
+  timer = setInterval(flushPartial, 1000);
 
   ws.on("message", async (data, isBinary) => {
     if (isBinary) {
