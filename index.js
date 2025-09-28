@@ -1,3 +1,4 @@
+// index.js
 import { WebSocketServer } from "ws";
 import express from "express";
 import cors from "cors";
@@ -14,7 +15,6 @@ import { randomUUID } from "crypto";
 import { v2 as speechV2, v1 as speechV1 } from "@google-cloud/speech";
 import textToSpeech from "@google-cloud/text-to-speech";
 import { scoreAttempt } from "./score.js";
-
 import { VertexAI } from "@google-cloud/vertexai";
 
 // ---------- FFmpeg (Render 등에서 필수)
@@ -28,9 +28,9 @@ const envAny = (keys, d = "") => {
 
 // 통일된 키 (이름은 GOOGLE_* 기본, 예전 GCP_*도 허용)
 const PROJECT_ID = envAny(["GOOGLE_PROJECT_ID", "GCP_PROJECT_ID"], "");
-const LOCATION   = envAny(["GOOGLE_LOCATION", "GEMINI_LOCATION", "GCP_LOCATION"], "us-central1");
+const LOCATION = envAny(["GOOGLE_LOCATION", "GEMINI_LOCATION", "GCP_LOCATION"], "us-central1");
 const RECOGNIZER_ID = envAny(["GOOGLE_RECOGNIZER_ID", "GCP_RECOGNIZER_ID"], "");
-const GEMINI_MODEL  = envAny(["GEMINI_MODEL"], "publishers/google/models/gemini-1.5-flash");
+const GEMINI_MODEL = envAny(["GEMINI_MODEL"], "publishers/google/models/gemini-1.5-flash");
 
 // ---------- Vertex AI
 const vertex = new VertexAI({ project: PROJECT_ID, location: LOCATION });
@@ -45,6 +45,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.options("*", cors());
+
 // --- 대화 세션 메모리 (간단히 보관)
 const sessions = new Map();
 function pushHistory(sid, role, text) {
@@ -62,13 +63,12 @@ app.post("/chat/reply", async (req, res) => {
     userText = "",
     level = "B1",
     topic = "Free talk",
-    lang = "en-US"
+    lang = "en-US",
   } = req.body || {};
 
   try {
     if (userText) pushHistory(sessionId, "user", userText);
 
-    // Vertex 초기화·환경변수는 네 코드 그대로 사용
     const gen = vertex.getGenerativeModel({ model: GEMINI_MODEL });
     const system = `You are an upbeat ESL speaking tutor.
 - Keep turns short (max 2 sentences).
@@ -76,16 +76,17 @@ app.post("/chat/reply", async (req, res) => {
 - Topic: ${topic}, CEFR level: ${level}.
 - Speak ${lang}. If the learner struggles, simplify.`;
 
-    const history = (sessions.get(sessionId) || [])
-      .flatMap(m => [{ role: m.role, parts: [{ text: m.text }]}]);
+    const history = (sessions.get(sessionId) || []).flatMap((m) => [
+      { role: m.role, parts: [{ text: m.text }] },
+    ]);
 
     const r = await gen.generateContent({
-      contents: [{ role: "user", parts: [{ text: system }] }, ...history]
+      contents: [{ role: "user", parts: [{ text: system }] }, ...history],
     });
 
     const text =
-      r.response?.candidates?.[0]?.content?.parts?.[0]?.text?.trim()
-      || "Let's keep going!";
+      r.response?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ||
+      "Let's keep going!";
 
     pushHistory(sessionId, "assistant", text);
     res.json({ ok: true, sessionId, text });
@@ -118,14 +119,10 @@ app.get("/healthz", (_, res) => res.json({ ok: true }));
 
 // ---- 작은 유틸: 타임아웃 래퍼
 const withTimeout = (p, ms) =>
-  Promise.race([
-    p,
-    new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms)),
-  ]);
+  Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms))]);
 
 // ---- TTS
 function pickVoice(lang = "en-US") {
-  // 필요하면 더 추가
   if (lang.startsWith("ko")) return { languageCode: "ko-KR", name: "ko-KR-Neural2-A" };
   if (lang.startsWith("ja")) return { languageCode: "ja-JP", name: "ja-JP-Neural2-B" };
   if (lang.startsWith("zh")) return { languageCode: "cmn-CN", name: "cmn-CN-Wavenet-A" };
@@ -154,7 +151,7 @@ async function sttV2RecognizeBase64(wavB64, hints = [], recognizerOverride) {
       autoDecodingConfig: {},
       features: { enableAutomaticPunctuation: true },
       ...(hints?.length
-        ? { adaptation: { phraseSets: [{ phrases: hints.map(v => ({ value: v })), boost: 20.0 }] } }
+        ? { adaptation: { phraseSets: [{ phrases: hints.map((v) => ({ value: v })), boost: 20.0 }] } }
         : {}),
     },
     content: wavB64,
@@ -167,17 +164,15 @@ async function sttV2RecognizeBase64(wavB64, hints = [], recognizerOverride) {
   return text;
 }
 
-// ── 메인 REST 엔드포인트 ──────────────────────────────────
+// ── 파일 업로드 채점 ───────────────────────────────────────
 app.post("/stt/score", upload.single("audio"), async (req, res) => {
   let inPath, outPath;
   try {
-    // 0) 업로드 유효성
     if (!req.file) return res.status(400).json({ ok: false, error: "audio file is required" });
-    if (!req.file.buffer?.length) return res.status(400).json({ ok: false, error: "empty audio upload" });
+    if (!req.file.buffer?.length)
+      return res.status(400).json({ ok: false, error: "empty audio upload" });
 
-    // 1) 입력 파라미터
     const target = req.body?.target || "";
-    // v2에서는 Recognizer가 언어를 가짐. lang은 코칭/음성언어용으로 활용
     const langForHints = req.body?.lang || "en-US";
 
     let hints = [];
@@ -189,9 +184,8 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
     }
     const wantSemantic = req.body?.semantic === "1";
     const wantCoach = req.body?.coach === "1";
-    const wantTTS = req.body?.tts === "1"; // ← 응답 음성 포함 여부
+    const wantTTS = req.body?.tts === "1";
 
-    // 2) 임시 파일
     const mt = (req.file.mimetype || "").toLowerCase();
     const ext =
       mt.includes("mp4") ? "mp4" :
@@ -205,7 +199,6 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
     outPath = path.join(tmpdir(), `${randomUUID()}.wav`);
     await fs.writeFile(inPath, req.file.buffer);
 
-    // 3) WAV 변환
     await toLinear16(inPath, outPath);
     const wavBytes = await fs.readFile(outPath);
     if (!wavBytes.length) {
@@ -213,7 +206,6 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
     }
     const wavB64 = wavBytes.toString("base64");
 
-    // 4) STT: v2 → (옵션) v1 폴백
     const recognizerPath = `projects/${PROJECT_ID}/locations/${LOCATION}/recognizers/${RECOGNIZER_ID}`;
     let transcript = "";
 
@@ -239,17 +231,15 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
             .trim();
         } catch (e1) {
           console.error("[v1 fallback failed]", e1?.message || e1);
-          throw e1; // 최종 에러
+          throw e1;
         }
       } else {
-        throw e; // 폴백 비활성 시 에러 그대로
+        throw e;
       }
     }
 
-    // 5) 스코어링
     const scoring = scoreAttempt({ transcript, targetText: target });
 
-    // 6) 시맨틱(임베딩) — 6초 제한, 실패 시 스킵
     let semantic = null;
     if (wantSemantic && target && transcript) {
       try {
@@ -266,14 +256,13 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
         const dot = a.reduce((s, v, i) => s + v * b[i], 0);
         const na = Math.sqrt(a.reduce((s, v) => s + v * v, 0));
         const nb = Math.sqrt(b.reduce((s, v) => s + v * v, 0));
-        const cos = dot / (na * nb);                    // -1..1
-        semantic = Math.round(((cos + 1) / 2) * 100);   // 0..100
+        const cos = dot / (na * nb);
+        semantic = Math.round(((cos + 1) / 2) * 100);
       } catch (err) {
         console.error("[embedding skipped]", err?.message || err);
       }
     }
 
-    // 7) Gemini 코칭(JSON 강제) — 6초 제한, 실패 시 스킵
     let aiFeedback = null;
     try {
       if (wantCoach) {
@@ -303,7 +292,6 @@ Transcript: """${transcript}"""`;
       aiFeedback = null;
     }
 
-    // 8) (옵션) TTS로 코치 발화 준비
     let coachSpeechB64 = "";
     const speakLine =
       aiFeedback?.next_prompt ||
@@ -316,42 +304,56 @@ Transcript: """${transcript}"""`;
       }
     }
 
-    // 9) 응답
     res.json({ ok: true, transcript, scoring, semantic, aiFeedback, coachSpeechB64, speakLine });
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok: false, error: String(e) });
   } finally {
-    try { if (inPath) await fs.unlink(inPath); } catch {}
-    try { if (outPath) await fs.unlink(outPath); } catch {}
+    try {
+      if (inPath) await fs.unlink(inPath);
+    } catch {}
+    try {
+      if (outPath) await fs.unlink(outPath);
+    } catch {}
   }
 });
 
 const PORT = process.env.PORT || 8080;
 const server = app.listen(PORT, () => console.log("Server on " + PORT));
 
-// ── WS 스트리밍 (pseudo-live) ──────────────────────────────
-const wss = new WebSocketServer({ server, path: "/stt/stream" });
+/* ───────────────────────── WS 스트리밍 (pseudo-live) ───────────────────────── */
 
-// 공용: base64 WAV 를 받아 STT v2로 돌리는 함수 (위에 정의됨)
-// async function sttV2RecognizeBase64(...)
+// ★ 첫 바이너리 청크로 컨테이너 추정
+function guessExt(buf = Buffer.alloc(0)) {
+  try {
+    if (buf.length >= 12 && buf.slice(4, 8).toString() === "ftyp") return "mp4"; // ISO-BMFF
+    if (buf.slice(0, 4).toString() === "OggS") return "ogg";                      // OGG
+    if (buf.slice(0, 4).toString("hex") === "1a45dfa3") return "webm";            // EBML(WebM)
+  } catch {}
+  return "dat"; // 모르면 ffmpeg 자동탐지
+}
+
+const wss = new WebSocketServer({ server, path: "/stt/stream" });
 
 wss.on("connection", (ws) => {
   ws.send(JSON.stringify({ type: "ready" }));
 
-  let chunks = [];            // Uint8Array[]
+  let chunks = [];        // Uint8Array[]
+  let firstChunk = null;  // ★ 첫 청크 저장
   let timer = null;
   let lastPartial = "";
-  let flushing = false;       // 동시 실행 방지
+  let flushing = false;   // 동시 실행 방지
   let totalBytes = 0;
-  const MAX_BYTES = 8 * 1024 * 1024; // 8MB 이상이면 오래된 조각 버림
+  const MAX_BYTES = 8 * 1024 * 1024;
 
   const flushPartial = async () => {
     if (flushing) return;
     flushing = true;
     try {
       if (!chunks.length) return;
-      const inPath = path.join(tmpdir(), `${randomUUID()}.webm`);
+
+      const ext = guessExt(firstChunk);
+      const inPath = path.join(tmpdir(), `${randomUUID()}.${ext}`);
       const outPath = path.join(tmpdir(), `${randomUUID()}.wav`);
       const buf = Buffer.concat(chunks);
       await fs.writeFile(inPath, buf);
@@ -364,7 +366,7 @@ wss.on("connection", (ws) => {
         lastPartial = text;
         ws.send(JSON.stringify({ type: "partial", text }));
       }
-    } catch (e) {
+    } catch {
       // 부분 인식 에러는 조용히 스킵
     } finally {
       flushing = false;
@@ -377,6 +379,7 @@ wss.on("connection", (ws) => {
   ws.on("message", async (data, isBinary) => {
     if (isBinary) {
       const b = Buffer.from(data);
+      if (!firstChunk) firstChunk = b; // ★ 첫 청크 채우기
       chunks.push(b);
       totalBytes += b.length;
       while (totalBytes > MAX_BYTES && chunks.length > 1) {
@@ -385,13 +388,15 @@ wss.on("connection", (ws) => {
       }
       return;
     }
+
     const msg = data.toString();
     if (msg === "stop") {
       clearInterval(timer);
       try {
         await flushPartial(); // 마지막 부분
         if (chunks.length) {
-          const inPath = path.join(tmpdir(), `${randomUUID()}.webm`);
+          const ext = guessExt(firstChunk);
+          const inPath = path.join(tmpdir(), `${randomUUID()}.${ext}`);
           const outPath = path.join(tmpdir(), `${randomUUID()}.wav`);
           const buf = Buffer.concat(chunks);
           await fs.writeFile(inPath, buf);
@@ -407,14 +412,14 @@ wss.on("connection", (ws) => {
       } catch (e) {
         ws.send(JSON.stringify({ type: "error", error: e?.message || String(e) }));
       } finally {
+        // 상태 초기화
         chunks = [];
+        firstChunk = null;
         lastPartial = "";
         totalBytes = 0;
       }
     }
   });
 
-  ws.on("close", () => {
-    clearInterval(timer);
-  });
+  ws.on("close", () => clearInterval(timer));
 });
