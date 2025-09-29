@@ -6,97 +6,89 @@ import multer from "multer";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
 
-import { promises as fs } from "fs";
+import { promises as fs } from "fs";     // 비동기 FS (writeFile/readFile/unlink)
+import fsSync from "fs";                 // 동기 FS (debug용 readFileSync)
 import { tmpdir } from "os";
 import path from "path";
 import { randomUUID } from "crypto";
 
 import { v2 as speechV2, v1 as speechV1 } from "@google-cloud/speech";
 import textToSpeech from "@google-cloud/text-to-speech";
+import { VertexAI } from "@google-cloud/vertexai";
+import { GoogleAuth } from "google-auth-library";
 import { scoreAttempt } from "./score.js";
 
-import fs from "fs";
-import { GoogleAuth } from "google-auth-library";
+/* ===========================
+   (옵션) 자격증명/토큰 디버그
+   =========================== */
+if (process.env.DEBUG_CRED === "1") {
+  try {
+    const raw = fsSync.readFileSync(process.env.GOOGLE_APPLICATION_CREDENTIALS, "utf8");
+    const cred = JSON.parse(raw);
+    console.log("[cred]", {
+      client_email: cred.client_email,
+      private_key_id: cred.private_key_id,
+      project_id: cred.project_id,
+      hasBeginEnd:
+        cred.private_key?.startsWith("-----BEGIN PRIVATE KEY-----\n") &&
+        cred.private_key?.trimEnd().endsWith("END PRIVATE KEY-----"),
+      hasNewlines: cred.private_key?.includes("\n") ?? false,
+    });
+  } catch (e) {
+    console.error("[cred] READ FAIL:", e);
+  }
 
-// (A) 서버가 읽는 키 파일 확인
-try {
-  const raw = fs.readFileSync(process.env.GOOGLE_APPLICATION_CREDENTIALS, "utf8");
-  const { client_email, private_key_id, project_id } = JSON.parse(raw);
-  console.log("[cred]", { client_email, private_key_id, project_id });
-} catch (e) {
-  console.error("[cred] READ FAIL:", e);
+  (async () => {
+    try {
+      const auth = new GoogleAuth({ scopes: ["https://www.googleapis.com/auth/cloud-platform"] });
+      const client = await auth.getClient();
+      const token = await client.getAccessToken();
+      const project = await auth.getProjectId();
+      console.log("[auth]", { project, hasToken: !!(token && token.token) });
+    } catch (e) {
+      console.error("[auth] ADC FAILED:", e);
+    }
+  })();
 }
 
-// (B) 실제로 토큰이 만들어지는지 확인
-(async () => {
-  try {
-    const auth = new GoogleAuth({ scopes: ["https://www.googleapis.com/auth/cloud-platform"] });
-    const client = await auth.getClient();
-    const token = await client.getAccessToken();
-    const project = await auth.getProjectId();
-    console.log("[auth]", { project, hasToken: !!(token && token.token) });
-  } catch (e) {
-    console.error("[auth] ADC FAILED:", e);
-  }
-})();
-
-import { VertexAI } from "@google-cloud/vertexai";
-// ===== debug: verify ADC & token =====
-import { GoogleAuth } from 'google-auth-library';
-(async () => {
-  try {
-    const auth = new GoogleAuth({ scopes: ['https://www.googleapis.com/auth/cloud-platform'] });
-    const client = await auth.getClient();
-    const token = await client.getAccessToken();
-    const project = await auth.getProjectId();
-    console.log('[auth] project =', project, ' token?', !!(token && token.token));
-  } catch (e) {
-    console.error('[auth] ADC FAILED:', e);
-  }
-})();
-// =====================================
-
-
-// ---------- FFmpeg (Render 등에서 필수)
+/* ---------- FFmpeg (Render 등에서 필수) ---------- */
 if (ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
 
-// ---------- Env helpers (과거/현재 키 병행 지원)
+/* ---------- Env helpers (과거/현재 키 병행 지원) ---------- */
 const envAny = (keys, d = "") => {
   for (const k of keys) if (process.env[k] != null) return process.env[k];
   return d;
 };
 
 // 통일된 키 (이름은 GOOGLE_* 기본, 예전 GCP_*도 허용)
-const PROJECT_ID = envAny(["GOOGLE_PROJECT_ID", "GCP_PROJECT_ID"], "");
-const LOCATION = envAny(["GOOGLE_LOCATION", "GEMINI_LOCATION", "GCP_LOCATION"], "us-central1");
-const RECOGNIZER_ID = envAny(["GOOGLE_RECOGNIZER_ID", "GCP_RECOGNIZER_ID"], "");
-const GEMINI_MODEL = envAny(["GEMINI_MODEL"], "publishers/google/models/gemini-1.5-flash");
+const PROJECT_ID   = envAny(["GOOGLE_PROJECT_ID", "GCP_PROJECT_ID"], "");
+const LOCATION     = envAny(["GOOGLE_LOCATION", "GEMINI_LOCATION", "GCP_LOCATION"], "us-central1");
+const RECOGNIZER_ID= envAny(["GOOGLE_RECOGNIZER_ID", "GCP_RECOGNIZER_ID"], "");
+const GEMINI_MODEL = envAny(["GEMINI_MODEL"], "gemini-1.5-flash-002");
 
-// ---------- Vertex AI
+/* ---------- Vertex AI / Speech / TTS ---------- */
 const vertex = new VertexAI({ project: PROJECT_ID, location: LOCATION });
+const sttV2  = new speechV2.SpeechClient();
+const sttV1  = new speechV1.SpeechClient();
+const tts    = new textToSpeech.TextToSpeechClient();
 
-// ---------- Speech / TTS
-const sttV2 = new speechV2.SpeechClient();
-const sttV1 = new speechV1.SpeechClient();
-const tts = new textToSpeech.TextToSpeechClient();
-
-// ---------- Express 기본
+/* ---------- Express 기본 ---------- */
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.options("*", cors());
 
-// --- 대화 세션 메모리 (간단히 보관)
+/* --- 대화 세션 메모리 (간단 보관) --- */
 const sessions = new Map();
 function pushHistory(sid, role, text) {
   if (!sessions.has(sid)) sessions.set(sid, []);
   const hist = sessions.get(sid);
   hist.push({ role, text });
-  if (hist.length > 12) hist.splice(0, hist.length - 12); // 최근 12턴만 유지
+  if (hist.length > 12) hist.splice(0, hist.length - 12);
   return hist;
 }
 
-// --- 대화 응답 API
+/* --- 대화 응답 API --- */
 app.post("/chat/reply", async (req, res) => {
   const {
     sessionId = randomUUID(),
@@ -135,13 +127,13 @@ app.post("/chat/reply", async (req, res) => {
   }
 });
 
-// 업로드는 메모리 저장 (buffer 사용)
+/* --- 업로드 메모리 저장 --- */
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 20 * 1024 * 1024 },
 });
 
-// webm/mp4/aac/ogg/mp3 → WAV(PCM_S16LE, mono, 16k)
+/* --- webm/mp4/aac/ogg/mp3 → WAV(PCM_S16LE, mono, 16k) --- */
 function toLinear16(inputPath, outPath) {
   return new Promise((resolve, reject) => {
     ffmpeg(inputPath)
@@ -157,11 +149,11 @@ function toLinear16(inputPath, outPath) {
 app.get("/", (_, res) => res.send("OK speaking tutor server"));
 app.get("/healthz", (_, res) => res.json({ ok: true }));
 
-// ---- 작은 유틸: 타임아웃 래퍼
+/* ---- 작은 유틸: 타임아웃 래퍼 ---- */
 const withTimeout = (p, ms) =>
   Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms))]);
 
-// ---- TTS
+/* ---- TTS ---- */
 function pickVoice(lang = "en-US") {
   if (lang.startsWith("ko")) return { languageCode: "ko-KR", name: "ko-KR-Neural2-A" };
   if (lang.startsWith("ja")) return { languageCode: "ja-JP", name: "ja-JP-Neural2-B" };
@@ -179,7 +171,7 @@ async function synth(text, lang = "en-US") {
   return res.audioContent?.toString("base64") ?? "";
 }
 
-// ---- STT v2 공용 호출
+/* ---- STT v2 공용 호출 ---- */
 async function sttV2RecognizeBase64(wavB64, hints = [], recognizerOverride) {
   const recognizerPath =
     recognizerOverride ||
@@ -204,7 +196,7 @@ async function sttV2RecognizeBase64(wavB64, hints = [], recognizerOverride) {
   return text;
 }
 
-// ── 파일 업로드 채점 ───────────────────────────────────────
+/* ── 파일 업로드 채점 ─────────────────────────────────────── */
 app.post("/stt/score", upload.single("audio"), async (req, res) => {
   let inPath, outPath;
   try {
@@ -223,19 +215,19 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
       hints = [];
     }
     const wantSemantic = req.body?.semantic === "1";
-    const wantCoach = req.body?.coach === "1";
-    const wantTTS = req.body?.tts === "1";
+    const wantCoach    = req.body?.coach === "1";
+    const wantTTS      = req.body?.tts === "1";
 
     const mt = (req.file.mimetype || "").toLowerCase();
     const ext =
-      mt.includes("mp4") ? "mp4" :
-      mt.includes("aac") ? "aac" :
-      mt.includes("3gpp") ? "3gp" :
-      mt.includes("mpeg") ? "mp3" :
-      mt.includes("ogg") ? "ogg" :
+      mt.includes("mp4")  ? "mp4"  :
+      mt.includes("aac")  ? "aac"  :
+      mt.includes("3gpp") ? "3gp"  :
+      mt.includes("mpeg") ? "mp3"  :
+      mt.includes("ogg")  ? "ogg"  :
       mt.includes("webm") ? "webm" : "dat";
 
-    inPath = path.join(tmpdir(), `${randomUUID()}.${ext}`);
+    inPath  = path.join(tmpdir(), `${randomUUID()}.${ext}`);
     outPath = path.join(tmpdir(), `${randomUUID()}.wav`);
     await fs.writeFile(inPath, req.file.buffer);
 
@@ -349,12 +341,8 @@ Transcript: """${transcript}"""`;
     console.error(e);
     res.status(500).json({ ok: false, error: String(e) });
   } finally {
-    try {
-      if (inPath) await fs.unlink(inPath);
-    } catch {}
-    try {
-      if (outPath) await fs.unlink(outPath);
-    } catch {}
+    try { if (inPath)  await fs.unlink(inPath); } catch {}
+    try { if (outPath) await fs.unlink(outPath); } catch {}
   }
 });
 
@@ -382,7 +370,7 @@ wss.on("connection", (ws) => {
   let firstChunk = null;  // ★ 첫 청크 저장
   let timer = null;
   let lastPartial = "";
-  let flushing = false;   // 동시 실행 방지
+  let flushing = false;
   let totalBytes = 0;
   const MAX_BYTES = 8 * 1024 * 1024;
 
@@ -413,18 +401,18 @@ wss.on("connection", (ws) => {
     }
   };
 
-  // 2초마다 부분 인식
+  // 1초마다 부분 인식
   timer = setInterval(flushPartial, 1000);
 
   ws.on("message", async (data, isBinary) => {
     if (isBinary) {
       const b = Buffer.from(data);
-      if (!firstChunk) firstChunk = b; // ★ 첫 청크 채우기
+      if (!firstChunk) firstChunk = b;
       chunks.push(b);
       totalBytes += b.length;
       while (totalBytes > MAX_BYTES && chunks.length > 1) {
         totalBytes -= chunks[0].length;
-        chunks.shift(); // 오래된 조각 제거
+        chunks.shift();
       }
       return;
     }
