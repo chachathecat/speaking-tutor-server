@@ -14,6 +14,32 @@ import { randomUUID } from "crypto";
 import { v2 as speechV2, v1 as speechV1 } from "@google-cloud/speech";
 import textToSpeech from "@google-cloud/text-to-speech";
 import { scoreAttempt } from "./score.js";
+
+import fs from "fs";
+import { GoogleAuth } from "google-auth-library";
+
+// (A) 서버가 읽는 키 파일 확인
+try {
+  const raw = fs.readFileSync(process.env.GOOGLE_APPLICATION_CREDENTIALS, "utf8");
+  const { client_email, private_key_id, project_id } = JSON.parse(raw);
+  console.log("[cred]", { client_email, private_key_id, project_id });
+} catch (e) {
+  console.error("[cred] READ FAIL:", e);
+}
+
+// (B) 실제로 토큰이 만들어지는지 확인
+(async () => {
+  try {
+    const auth = new GoogleAuth({ scopes: ["https://www.googleapis.com/auth/cloud-platform"] });
+    const client = await auth.getClient();
+    const token = await client.getAccessToken();
+    const project = await auth.getProjectId();
+    console.log("[auth]", { project, hasToken: !!(token && token.token) });
+  } catch (e) {
+    console.error("[auth] ADC FAILED:", e);
+  }
+})();
+
 import { VertexAI } from "@google-cloud/vertexai";
 // ===== debug: verify ADC & token =====
 import { GoogleAuth } from 'google-auth-library';
