@@ -16,6 +16,21 @@ import { v2 as speechV2, v1 as speechV1 } from "@google-cloud/speech";
 import textToSpeech from "@google-cloud/text-to-speech";
 import { scoreAttempt } from "./score.js";
 import { VertexAI } from "@google-cloud/vertexai";
+// ===== debug: verify ADC & token =====
+import { GoogleAuth } from 'google-auth-library';
+(async () => {
+  try {
+    const auth = new GoogleAuth({ scopes: ['https://www.googleapis.com/auth/cloud-platform'] });
+    const client = await auth.getClient();
+    const token = await client.getAccessToken();
+    const project = await auth.getProjectId();
+    console.log('[auth] project =', project, ' token?', !!(token && token.token));
+  } catch (e) {
+    console.error('[auth] ADC FAILED:', e);
+  }
+})();
+// =====================================
+
 
 // ---------- FFmpeg (Render 등에서 필수)
 if (ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
