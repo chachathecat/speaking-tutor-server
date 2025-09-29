@@ -68,9 +68,11 @@ const GEMINI_MODEL = envAny(["GEMINI_MODEL"], "gemini-1.5-flash-002");
 
 /* ---------- Vertex AI / Speech / TTS ---------- */
 const vertex = new VertexAI({ project: PROJECT_ID, location: LOCATION });
-const sttV2  = new speechV2.SpeechClient();
-const sttV1  = new speechV1.SpeechClient();
-const tts    = new textToSpeech.TextToSpeechClient();
+const KEYFILE = process.env.GOOGLE_APPLICATION_CREDENTIALS; // /etc/secrets/gcp.json
+
+const sttV2 = new speechV2.SpeechClient({ keyFilename: KEYFILE });
+const sttV1 = new speechV1.SpeechClient({ keyFilename: KEYFILE });
+const tts   = new textToSpeech.TextToSpeechClient({ keyFilename: KEYFILE });
 
 /* ---------- Express 기본 ---------- */
 const app = express();
