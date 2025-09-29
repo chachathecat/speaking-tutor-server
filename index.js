@@ -60,25 +60,52 @@ const envAny = (keys, d = "") => {
   return d;
 };
 
-// 통일된 키 (이름은 GOOGLE_* 기본, 예전 GCP_*도 허용)
-const PROJECT_ID   = envAny(["GOOGLE_PROJECT_ID", "GCP_PROJECT_ID"], "");
-const LOCATION     = envAny(["GOOGLE_LOCATION", "GEMINI_LOCATION", "GCP_LOCATION"], "us-central1");
-const RECOGNIZER_ID= envAny(["GOOGLE_RECOGNIZER_ID", "GCP_RECOGNIZER_ID"], "");
-const GEMINI_MODEL = envAny(["GEMINI_MODEL"], "gemini-1.5-flash-002");
+/* ====== 환경값: 리전 분리 (핵심 수정 지점) ====== */
+// 프로젝트
+const PROJECT_ID = envAny(["GOOGLE_PROJECT_ID", "GCP_PROJECT_ID"], "");
+
+// STT v2 리전 (recognizer가 위치한 곳) — 보통 'global'
+const SPEECH_LOCATION = envAny(
+  ["GOOGLE_SPEECH_LOCATION", "SPEECH_LOCATION", "GCP_SPEECH_LOCATION"],
+  "global"
+);
+// Vertex AI(Gemini/Embeddings) 리전 — us-central1 권장
+const VERTEX_LOCATION = envAny(
+  ["GEMINI_LOCATION", "VERTEX_LOCATION", "GOOGLE_VERTEX_LOCATION", "GCP_LOCATION", "GOOGLE_LOCATION"],
+  "us-central1"
+);
+
+// STT v2 recognizer ID
+const RECOGNIZER_ID = envAny(["GOOGLE_RECOGNIZER_ID", "GCP_RECOGNIZER_ID"], "");
+
+// Gemini 모델 (기본: 안정적인 'gemini-1.5-flash')
+const GEMINI_MODEL = envAny(["GEMINI_MODEL"], "gemini-1.5-flash");
 
 /* ---------- Vertex AI / Speech / TTS ---------- */
-const vertex = new VertexAI({ project: PROJECT_ID, location: LOCATION });
+const vertex = new VertexAI({ project: PROJECT_ID, location: VERTEX_LOCATION });
 const KEYFILE = process.env.GOOGLE_APPLICATION_CREDENTIALS; // /etc/secrets/gcp.json
 
 const sttV2 = new speechV2.SpeechClient({ keyFilename: KEYFILE });
 const sttV1 = new speechV1.SpeechClient({ keyFilename: KEYFILE });
 const tts   = new textToSpeech.TextToSpeechClient({ keyFilename: KEYFILE });
 
+/* ---------- 작은 유틸 ---------- */
+const recognizerPathOf = () =>
+  `projects/${PROJECT_ID}/locations/${SPEECH_LOCATION}/recognizers/${RECOGNIZER_ID}`;
+
+const withTimeout = (p, ms) =>
+  Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms))]);
+
 /* ---------- Express 기본 ---------- */
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.options("*", cors());
+
+// 부팅 로그(환경 확인)
+console.log("[boot] project:", PROJECT_ID);
+console.log("[boot] speech location:", SPEECH_LOCATION, " recognizer:", RECOGNIZER_ID);
+console.log("[boot] vertex location:", VERTEX_LOCATION, " model:", GEMINI_MODEL);
 
 /* --- 대화 세션 메모리 (간단 보관) --- */
 const sessions = new Map();
@@ -125,6 +152,7 @@ app.post("/chat/reply", async (req, res) => {
     pushHistory(sessionId, "assistant", text);
     res.json({ ok: true, sessionId, text });
   } catch (e) {
+    console.error("[/chat/reply] error:", e);
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
@@ -151,10 +179,6 @@ function toLinear16(inputPath, outPath) {
 app.get("/", (_, res) => res.send("OK speaking tutor server"));
 app.get("/healthz", (_, res) => res.json({ ok: true }));
 
-/* ---- 작은 유틸: 타임아웃 래퍼 ---- */
-const withTimeout = (p, ms) =>
-  Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms))]);
-
 /* ---- TTS ---- */
 function pickVoice(lang = "en-US") {
   if (lang.startsWith("ko")) return { languageCode: "ko-KR", name: "ko-KR-Neural2-A" };
@@ -175,9 +199,7 @@ async function synth(text, lang = "en-US") {
 
 /* ---- STT v2 공용 호출 ---- */
 async function sttV2RecognizeBase64(wavB64, hints = [], recognizerOverride) {
-  const recognizerPath =
-    recognizerOverride ||
-    `projects/${PROJECT_ID}/locations/${LOCATION}/recognizers/${RECOGNIZER_ID}`;
+  const recognizerPath = recognizerOverride || recognizerPathOf();
 
   const v2req = {
     recognizer: recognizerPath,
@@ -240,7 +262,7 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
     }
     const wavB64 = wavBytes.toString("base64");
 
-    const recognizerPath = `projects/${PROJECT_ID}/locations/${LOCATION}/recognizers/${RECOGNIZER_ID}`;
+    const recognizerPath = recognizerPathOf(); // <<< global 리전 사용
     let transcript = "";
 
     try {
@@ -281,7 +303,7 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
         const [refE, hypE] = await withTimeout(
           Promise.all([
             embedder.embedContent({ content: { parts: [{ text: target }] } }),
-            embedder.embedContent({ content: { parts: [{ text: transcript }] } }),
+            embedder.embedContent({ content: { parts: [{ text: transcript }] } } ),
           ]),
           6000
         );
@@ -340,7 +362,7 @@ Transcript: """${transcript}"""`;
 
     res.json({ ok: true, transcript, scoring, semantic, aiFeedback, coachSpeechB64, speakLine });
   } catch (e) {
-    console.error(e);
+    console.error("[/stt/score] error:", e);
     res.status(500).json({ ok: false, error: String(e) });
   } finally {
     try { if (inPath)  await fs.unlink(inPath); } catch {}
@@ -391,7 +413,8 @@ wss.on("connection", (ws) => {
       const wavB64 = (await fs.readFile(outPath)).toString("base64");
       await Promise.allSettled([fs.unlink(inPath), fs.unlink(outPath)]);
 
-      const text = await sttV2RecognizeBase64(wavB64, []);
+      // <<< recognizerPath 명시해 STT v2가 global 리전을 사용
+      const text = await sttV2RecognizeBase64(wavB64, [], recognizerPathOf());
       if (text && text !== lastPartial) {
         lastPartial = text;
         ws.send(JSON.stringify({ type: "partial", text }));
@@ -434,7 +457,7 @@ wss.on("connection", (ws) => {
           const wavB64 = (await fs.readFile(outPath)).toString("base64");
           await Promise.allSettled([fs.unlink(inPath), fs.unlink(outPath)]);
 
-          const finalText = await sttV2RecognizeBase64(wavB64, []);
+          const finalText = await sttV2RecognizeBase64(wavB64, [], recognizerPathOf());
           ws.send(JSON.stringify({ type: "final", text: finalText }));
         } else {
           ws.send(JSON.stringify({ type: "final", text: "" }));
