@@ -83,7 +83,11 @@ const RECOGNIZER_ID = envAny(["GOOGLE_RECOGNIZER_ID", "GCP_RECOGNIZER_ID"], "");
 const GEMINI_MODEL = envAny(["GEMINI_MODEL"], "gemini-1.5-flash");
 
 /* ---------- Vertex AI / Speech / TTS ---------- */
-const vertex = new VertexAI({ project: PROJECT_ID, location: VERTEX_LOCATION });
+const vertex = new VertexAI({
+  project: process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT_ID,
+  location: process.env.GEMINI_LOCATION || 'us-central1',
+});
+
 const KEYFILE = process.env.GOOGLE_APPLICATION_CREDENTIALS; // /etc/secrets/gcp.json
 
 const sttV2 = new speechV2.SpeechClient({ keyFilename: KEYFILE });
