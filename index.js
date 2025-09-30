@@ -79,7 +79,8 @@ const VERTEX_LOCATION = envAny(
 const RECOGNIZER_ID = envAny(["GOOGLE_RECOGNIZER_ID", "GCP_RECOGNIZER_ID"], "");
 
 // Gemini 모델 (기본: 안정적인 'gemini-1.5-flash')
-const GEMINI_MODEL = envAny(["GEMINI_MODEL"], "gemini-1.5-flash");
+// after
+const GEMINI_MODEL = envAny(["GEMINI_MODEL"], "gemini-1.5-flash-002");
 
 /* ---------- Vertex AI / Speech / TTS ---------- */
 const vertex = new VertexAI({ project: PROJECT_ID, location: VERTEX_LOCATION });
