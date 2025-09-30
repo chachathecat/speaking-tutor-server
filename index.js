@@ -78,14 +78,13 @@ const VERTEX_LOCATION = envAny(
 // STT v2 recognizer ID
 const RECOGNIZER_ID = envAny(["GOOGLE_RECOGNIZER_ID", "GCP_RECOGNIZER_ID"], "");
 
-// Gemini 모델 (기본: 안정적인 'gemini-1.5-flash')
-// after
-const GEMINI_MODEL = envAny(["GEMINI_MODEL"], "gemini-1.5-flash");
+// (기본값을 1.5 → 2.5로 변경)
+const GEMINI_MODEL = envAny(["GEMINI_MODEL"], "gemini-2.5-flash");
 
-/* ---------- Vertex AI / Speech / TTS ---------- */
+// Vertex 설정은 그대로
 const vertex = new VertexAI({
-  project: process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT_ID,
-  location: VERTEX_LOCATION, // 위에서 envAny로 받은 값(us-central1)
+  project: PROJECT_ID,
+  location: VERTEX_LOCATION, // us-central1
 });
 
 const KEYFILE = process.env.GOOGLE_APPLICATION_CREDENTIALS; // /etc/secrets/gcp.json
