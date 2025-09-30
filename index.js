@@ -62,7 +62,7 @@ const envAny = (keys, d = "") => {
 
 /* ====== 환경값: 리전 분리 (핵심 수정 지점) ====== */
 // 프로젝트
-const PROJECT_ID = envAny(["GOOGLE_PROJECT_ID", "GCP_PROJECT_ID"], "");
+const PROJECT_ID = envAny(["GOOGLE_CLOUD_PROJECT","GOOGLE_PROJECT_ID","GCP_PROJECT_ID"], "");
 
 // STT v2 리전 (recognizer가 위치한 곳) — 보통 'global'
 const SPEECH_LOCATION = envAny(
@@ -85,7 +85,7 @@ const GEMINI_MODEL = envAny(["GEMINI_MODEL"], "gemini-1.5-flash");
 /* ---------- Vertex AI / Speech / TTS ---------- */
 const vertex = new VertexAI({
   project: process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT_ID,
-  location: process.env.GEMINI_LOCATION || 'us-central1',
+  location: VERTEX_LOCATION, // 위에서 envAny로 받은 값(us-central1)
 });
 
 const KEYFILE = process.env.GOOGLE_APPLICATION_CREDENTIALS; // /etc/secrets/gcp.json
