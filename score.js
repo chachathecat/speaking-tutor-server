@@ -1,6 +1,3 @@
-// src/score.js  (ESM)
-// 사용: import { scoreAttempt } from "./score.js";
-
 export function scoreAttempt({
   transcript = "",
   targetText = "",
