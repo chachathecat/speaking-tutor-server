@@ -1,20 +1,38 @@
 // score.js — robust, kid-friendly scoring with fallbacks
 // Usage: import { scoreAttempt } from "./score.js";
 
-export function scoreAttempt({ transcript, targetText, audio = {}, lang = "auto" }) {
-  // ---------- helpers ----------
-  const clamp01 = (x) => Math.max(0, Math.min(1, Number.isFinite(x) ? x : 0));
+// score.js
+export function scoreAttempt({ transcript = "", targetText = "" }) {
+  const t = String(transcript || "").trim();
+  const ref = String(targetText || "").trim();
 
-  // unicode normalize + toLocaleLowerCase
-  const norm = (s, l) => (s || "").normalize("NFKC").toLocaleLowerCase(l).trim();
+  const len = t.split(/\s+/).filter(Boolean).length;
+  const punct = (t.match(/[.?!,]/g) || []).length;
+  const longWords = (t.match(/\b\w{7,}\b/g) || []).length;
+  const hasFillers = /\b(uh|um|like|you know|well)\b/i.test(t);
 
-  // tiny stopword lists (extend as needed)
-  const stop = {
-    en: new Set(["a","an","the","to","of","in","on","at","and","or","is","are","am","was","were","be","been","being","i","you","he","she","it","we","they","that","this","for","with","do","does","did"]),
-    ko: new Set(["은","는","이","가","을","를","에","에서","에게","그리고","또","또는","하지만","이다","입니다","했어요","하세요"]),
-    ja: new Set(["は","が","を","に","へ","と","も","や","の","です","ます","そして","でした","ください"]),
-    zh: new Set(["的","了","在","和","或","是","有","我","你","他","她","它","们"]),
-  };
+  // 어림 지표
+  let pron = 70 + Math.min(20, longWords * 2) - (hasFillers ? 5 : 0);
+  let flu = 50 + Math.min(35, Math.max(0, len - 8) * 3) + Math.min(10, punct * 2);
+  let pro = 55 + Math.min(30, punct * 5);
+  let gra = 65 + Math.min(30, longWords * 3) - (/[?!,]$/.test(t) ? 0 : 3);
+
+  if (!t) pron = flu = pro = gra = 0;
+
+  const clamp = (v) => Math.max(0, Math.min(100, Math.round(v)));
+  pron = clamp(pron); flu = clamp(flu); pro = clamp(pro); gra = clamp(gra);
+
+  const total = clamp(0.25 * pron + 0.25 * flu + 0.25 * pro + 0.25 * gra);
+
+  const feedback = [];
+  if (flu < 55) feedback.push("조금 더 자연스럽게 이어 말해보세요(연음/리듬).");
+  if (gra < 60) feedback.push("짧은 문장부터 정확하게—주어/동사 빠짐 체크.");
+  if (pro < 60) feedback.push("문장 끝 억양을 낮추고 쉼표로 리듬을 만들기.");
+  if (pron < 60) feedback.push("강세(syllable stress)와 모음 길이에 집중해보세요.");
+
+  return { total, pronunciation: pron, fluency: flu, prosody: pro, grammar: gra, feedback };
+}
+
 
   // very rough script guess
   function guessByText(s = "") {
