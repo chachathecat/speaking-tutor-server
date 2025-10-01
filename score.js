@@ -1,7 +1,3 @@
-// score.js — robust, kid-friendly scoring with fallbacks
-// Usage: import { scoreAttempt } from "./score.js";
-
-// score.js
 export function scoreAttempt({ transcript = "", targetText = "" }) {
   const t = String(transcript || "").trim();
   const ref = String(targetText || "").trim();
