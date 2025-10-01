@@ -1,3 +1,4 @@
+// index.js
 import { WebSocketServer } from "ws";
 import express from "express";
 import cors from "cors";
@@ -6,8 +7,8 @@ import multer from "multer";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
 
-import { promises as fs } from "fs";     // 비동기 FS (writeFile/readFile/unlink)
-import fsSync from "fs";                 // 동기 FS (debug용 readFileSync)
+import { promises as fs } from "fs";
+import fsSync from "fs";
 import { tmpdir } from "os";
 import path from "path";
 import { randomUUID } from "crypto";
@@ -60,38 +61,28 @@ const envAny = (keys, d = "") => {
   return d;
 };
 
-/* ====== 환경값: 리전 분리 (핵심 수정 지점) ====== */
-// 프로젝트
-const PROJECT_ID = envAny(["GOOGLE_CLOUD_PROJECT","GOOGLE_PROJECT_ID","GCP_PROJECT_ID"], "");
+/* ====== 환경값: 리전 분리 ====== */
+const PROJECT_ID = envAny(["GOOGLE_CLOUD_PROJECT", "GOOGLE_PROJECT_ID", "GCP_PROJECT_ID"], "");
 
-// STT v2 리전 (recognizer가 위치한 곳) — 보통 'global'
 const SPEECH_LOCATION = envAny(
   ["GOOGLE_SPEECH_LOCATION", "SPEECH_LOCATION", "GCP_SPEECH_LOCATION"],
   "global"
 );
-// Vertex AI(Gemini/Embeddings) 리전 — us-central1 권장
 const VERTEX_LOCATION = envAny(
   ["GEMINI_LOCATION", "VERTEX_LOCATION", "GOOGLE_VERTEX_LOCATION", "GCP_LOCATION", "GOOGLE_LOCATION"],
   "us-central1"
 );
-
-// STT v2 recognizer ID
 const RECOGNIZER_ID = envAny(["GOOGLE_RECOGNIZER_ID", "GCP_RECOGNIZER_ID"], "");
-
-// (기본값을 1.5 → 2.5로 변경)
 const GEMINI_MODEL = envAny(["GEMINI_MODEL"], "gemini-2.5-flash");
 
-// Vertex 설정은 그대로
-const vertex = new VertexAI({
-  project: PROJECT_ID,
-  location: VERTEX_LOCATION, // us-central1
-});
-
 const KEYFILE = process.env.GOOGLE_APPLICATION_CREDENTIALS; // /etc/secrets/gcp.json
+const clientOpts = KEYFILE ? { keyFilename: KEYFILE } : {}; // ADC 도 허용
 
-const sttV2 = new speechV2.SpeechClient({ keyFilename: KEYFILE });
-const sttV1 = new speechV1.SpeechClient({ keyFilename: KEYFILE });
-const tts   = new textToSpeech.TextToSpeechClient({ keyFilename: KEYFILE });
+/* ---------- GCP 클라이언트 ---------- */
+const vertex = new VertexAI({ project: PROJECT_ID, location: VERTEX_LOCATION });
+const sttV2 = new speechV2.SpeechClient(clientOpts);
+const sttV1 = new speechV1.SpeechClient(clientOpts);
+const tts   = new textToSpeech.TextToSpeechClient(clientOpts);
 
 /* ---------- 작은 유틸 ---------- */
 const recognizerPathOf = () =>
@@ -102,12 +93,22 @@ const withTimeout = (p, ms) =>
 
 /* ---------- Express 기본 ---------- */
 const app = express();
+app.set("trust proxy", 1);
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "1mb" })); // 바디가 길어지는 경우 방지
 app.options("*", cors());
 
-// 부팅 로그(환경 확인)
-console.log("[boot] project:", PROJECT_ID);
+// 공통 CORS/프록시 헤더 (특히 SSE)
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Accept");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
+// 부팅 로그
+console.log("[boot] project:", PROJECT_ID || "(ADC)");
 console.log("[boot] speech location:", SPEECH_LOCATION, " recognizer:", RECOGNIZER_ID);
 console.log("[boot] vertex location:", VERTEX_LOCATION, " model:", GEMINI_MODEL);
 
@@ -121,7 +122,7 @@ function pushHistory(sid, role, text) {
   return hist;
 }
 
-/* --- 대화 응답 API --- */
+/* --- 레거시 단발 응답 API (유지) --- */
 app.post("/chat/reply", async (req, res) => {
   const {
     sessionId = randomUUID(),
@@ -266,7 +267,7 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
     }
     const wavB64 = wavBytes.toString("base64");
 
-    const recognizerPath = recognizerPathOf(); // <<< global 리전 사용
+    const recognizerPath = recognizerPathOf(); // global 리전 사용
     let transcript = "";
 
     try {
@@ -307,7 +308,7 @@ app.post("/stt/score", upload.single("audio"), async (req, res) => {
         const [refE, hypE] = await withTimeout(
           Promise.all([
             embedder.embedContent({ content: { parts: [{ text: target }] } }),
-            embedder.embedContent({ content: { parts: [{ text: transcript }] } } ),
+            embedder.embedContent({ content: { parts: [{ text: transcript }] } }),
           ]),
           6000
         );
@@ -377,6 +378,99 @@ Transcript: """${transcript}"""`;
 const PORT = process.env.PORT || 8080;
 const server = app.listen(PORT, () => console.log("Server on " + PORT));
 
+/* ---- SSE: /stt/chat (LLM 대화 스트리밍) ---- */
+app.post("/stt/chat", async (req, res) => {
+  const accept = String(req.get("accept") || "");
+  const wantsSSE = accept.includes("text/event-stream");
+
+  const body = req.body || {};
+  const {
+    system = "",
+    history = [], // [{role:'user'|'assistant', content/text:'...'}]
+    state = {},   // {topic, level, wpm, scoring, hint, goals}
+  } = body;
+
+  // 언어 기본값
+  const targetLang = body.targetLang || body.lang || "en-US";
+  const nativeLang = body.nativeLang || "ko-KR";
+
+  // 프론트가 개별 필드로 보낸 경우 폴백 병합
+  const mergedState = Object.keys(state).length ? state : {
+    topic: body.topic, level: body.level, wpm: body.wpm,
+    scoring: body.scoring, hint: body.hint, goals: body.goals,
+  };
+
+  const gen = vertex.getGenerativeModel({ model: GEMINI_MODEL });
+
+  const sysText = (system || `
+You are a friendly speaking coach. Keep replies to 1–2 sentences.
+ALWAYS end with exactly one smart follow-up question.
+Correct only impactful mistakes in ≤1 short line.
+Speak in {{targetLang}}; use {{nativeLang}} only for brief tips.
+Adapt topic/level/speed based on 'State'.
+  `).replace("{{targetLang}}", targetLang).replace("{{nativeLang}}", nativeLang);
+
+  const toVertexRole = (r) => (r === "assistant" ? "model" : "user");
+  const contents = [
+    { role: "user", parts: [{ text: sysText }] },
+    ...(Array.isArray(history) ? history : []).map(m => ({
+      role: toVertexRole(m.role),
+      parts: [{ text: String(m.content ?? m.text ?? "") }]
+    })),
+    { role: "user", parts: [{ text: `State:\n${JSON.stringify(mergedState)}` }] }
+  ];
+
+  if (wantsSSE) {
+    // 스트리밍 헤더
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-store, must-revalidate",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
+      "Access-Control-Allow-Origin": "*",
+    });
+
+    const keepalive = setInterval(() => {
+      try { res.write(":ka\n\n"); } catch {}
+    }, 15000);
+
+    const onClose = () => {
+      clearInterval(keepalive);
+      try { res.end(); } catch {}
+    };
+    req.on("close", onClose);
+    req.on("aborted", onClose);
+
+    try {
+      const stream = await gen.generateContentStream({ contents });
+      for await (const chunk of stream.stream) {
+        const part = chunk?.candidates?.[0]?.content?.parts?.[0];
+        const text = part?.text || "";
+        if (text) res.write(`data: ${text}\n\n`);
+      }
+      res.write("data: [DONE]\n\n");
+      res.end();
+    } catch (e) {
+      res.write(`data: (error) ${String(e?.message || e)}\n\n`);
+      res.write("data: [DONE]\n\n");
+      res.end();
+    } finally {
+      clearInterval(keepalive);
+    }
+    return;
+  }
+
+  // JSON 단발 폴백
+  try {
+    const r = await gen.generateContent({ contents });
+    const text = r.response?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "Let's keep going!";
+    res.json({ ok: true, text });
+  } catch (e) {
+    console.error("[/stt/chat] error:", e);
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
 /* ───────────────────────── WS 스트리밍 (pseudo-live) ───────────────────────── */
 
 // ★ 첫 바이너리 청크로 컨테이너 추정
@@ -394,8 +488,8 @@ const wss = new WebSocketServer({ server, path: "/stt/stream" });
 wss.on("connection", (ws) => {
   ws.send(JSON.stringify({ type: "ready" }));
 
-  let chunks = [];        // Uint8Array[]
-  let firstChunk = null;  // ★ 첫 청크 저장
+  let chunks = [];
+  let firstChunk = null;
   let timer = null;
   let lastPartial = "";
   let flushing = false;
@@ -417,7 +511,6 @@ wss.on("connection", (ws) => {
       const wavB64 = (await fs.readFile(outPath)).toString("base64");
       await Promise.allSettled([fs.unlink(inPath), fs.unlink(outPath)]);
 
-      // <<< recognizerPath 명시해 STT v2가 global 리전을 사용
       const text = await sttV2RecognizeBase64(wavB64, [], recognizerPathOf());
       if (text && text !== lastPartial) {
         lastPartial = text;
