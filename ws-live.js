@@ -1,113 +1,95 @@
-// ws-live.js
-import { WebSocketServer } from "ws";
-import ffmpeg from "fluent-ffmpeg";
-import ffmpegPath from "ffmpeg-static";
-import { v1 as speechV1 } from "@google-cloud/speech";
-import { randomUUID } from "crypto";
+import { v2 as speech } from '@google-cloud/speech';
+import { PassThrough } from 'node:stream';
 
-if (ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
+const DEFAULT_LANGS = (process.env.DEFAULT_LANGS || 'en-US').split(','); // 다중 가능
+const PROJECT = process.env.GCP_PROJECT_ID;
+const LOCATION = process.env.GCP_LOCATION || 'us-central1';
+const RECOGNIZER_ID = process.env.GCP_RECOGNIZER_ID;
 
-export function installLiveSTT({ server, path = "/stt/live" }) {
-  const stt = new speechV1.SpeechClient({
-    keyFilename: process.env.GOOGLE_APPLICATION_CREDENTIALS
-  });
+function recognizerPath() {
+  if (!PROJECT || !LOCATION || !RECOGNIZER_ID) throw new Error('Missing GCP_* env');
+  return `projects/${PROJECT}/locations/${LOCATION}/recognizers/${RECOGNIZER_ID}`;
+}
 
-  const wss = new WebSocketServer({ server, path });
+export function setupLiveWS(wss, { logger }) {
+  // Heartbeat
+  const interval = setInterval(() => {
+    wss.clients.forEach((s) => {
+      if (!s.isAlive) return s.terminate();
+      s.isAlive = false; try{ s.ping(); }catch{}
+    });
+  }, 15000);
+  wss.on('close', ()=>clearInterval(interval));
 
-  wss.on("connection", (ws) => {
-    let ff = null;
-    let stream = null;
-    let closed = false;
+  wss.on('connection', async (ws) => {
+    ws.isAlive = true;
+    ws.on('pong', ()=>{ ws.isAlive = true; });
 
-    const config = {
-      config: {
-        encoding: "LINEAR16",
-        sampleRateHertz: 16000,
-        languageCode: "en-US",
-        enableWordTimeOffsets: true,
-        enableWordConfidence: true,
-        enableAutomaticPunctuation: true
-      },
-      interimResults: true,
-      singleUtterance: false
-    };
+    const client = new speech.SpeechClient();
+    let langs = DEFAULT_LANGS; // ['en-US'] 또는 ['en-US','ko-KR', ...]
+    let stream = null, audioPipe = null, open = false;
 
-    function start() {
-      // Opus/mp4 → PCM 파이프
-      const pcm = ffmpeg()
-        .input("pipe:0")
-        .inputOptions(["-thread_queue_size 1024"])
-        .outputOptions(["-ac 1", "-ar 16000", "-f s16le", "-acodec pcm_s16le"])
-        .on("error", () => {})
-        .pipe();
+    function startStream(){
+      const initial = {
+        recognizer: recognizerPath(),
+        streamingConfig: {
+          config: {
+            autoDecodingConfig: {},
+            features: {
+              enableWordTimeOffsets: true,
+              enableWordConfidence: true,
+              enableAutomaticPunctuation: true
+            },
+            languageCodes: langs,  // ★ 여러 언어 동시 허용
+            model: 'long'
+          },
+          interimResults: true
+        }
+      };
+      stream = client.streamingRecognize(); open = true;
 
-      stream = stt
-        .streamingRecognize(config)
-        .on("error", (e) => {
-          if (!closed) ws.send(JSON.stringify({ type: "error", error: String(e.message || e) }));
-        })
-        .on("data", (d) => {
-          const result = d.results?.[0];
-          const alt = result?.alternatives?.[0];
-          if (!alt) return;
-          const text = alt.transcript || "";
-          const words = (alt.words || []).map((w) => ({
-            w: w.word,
-            start:
-              Number(w.startTime?.seconds || 0) +
-              Number(w.startTime?.nanos || 0) / 1e9,
-            end:
-              Number(w.endTime?.seconds || 0) +
-              Number(w.endTime?.nanos || 0) / 1e9,
-            conf: w.confidence ?? 0
-          }));
-          ws.send(
-            JSON.stringify({
-              type: result.isFinal ? "final" : "partial",
-              text,
-              words
-            })
-          );
-        });
+      stream.on('data', (data)=>{
+        try{
+          for (const r of (data.results||[])) {
+            const alt = r.alternatives?.[0]; if (!alt) continue;
+            const words = (alt.words||[]).map(w=>({
+              w: w.word,
+              start: Number(w.startOffset?.seconds||0)+(Number(w.startOffset?.nanos||0)/1e9),
+              end:   Number(w.endOffset?.seconds||0)+(Number(w.endOffset?.nanos||0)/1e9),
+              conf:  Number(w.confidence||0)
+            }));
+            ws.send(JSON.stringify({ type: r.isFinal?'final':'partial', text: alt.transcript||'', words }));
+          }
+        }catch(e){ logger.warn({ err:e }, 'WS send failed'); }
+      });
+      stream.on('error', (err)=>{ logger.error({ err }, 'GCP stream error'); safeClose(); });
+      stream.on('end', ()=>{ open=false; });
 
-      pcm.on("data", (chunk) => stream.write({ audioContent: chunk }));
-      ff = pcm;
+      audioPipe = new PassThrough();
+      audioPipe.on('data', (chunk)=>{ if(open) stream.write({ audio:{ content: chunk } }); });
+      stream.write(initial);
     }
 
-    start();
-    ws.send(JSON.stringify({ type: "ready", id: randomUUID() }));
+    function safeClose(){ try{ stream?.end(); }catch{}; try{ audioPipe?.end(); }catch{}; try{ ws.close(); }catch{}; }
 
-    ws.on("message", (data, isBinary) => {
-      if (isBinary) {
-        ff?.write(data);
+    ws.on('message', (msg, isBinary)=>{
+      if (!isBinary){
+        try{
+          const j = JSON.parse(msg.toString('utf8'));
+          if (j.cmd==='lang'){
+            // j.lang: string | string[]
+            if (Array.isArray(j.lang) && j.lang.length) langs = j.lang;
+            else if (typeof j.lang==='string') langs = [ j.lang.includes('-')?j.lang:`${j.lang}-US` ];
+          } else if (j.cmd==='startSegment'){ if (!stream) startStream(); }
+          else if (j.cmd==='endSegment'){ if (stream){ try{ stream.end(); }catch{}; stream=null; open=false; } }
+        }catch{}
         return;
       }
-      const s = String(data || "");
-      if (s.startsWith("{")) {
-        try {
-          const j = JSON.parse(s);
-          if (j.cmd === "lang" && j.lang) config.config.languageCode = j.lang;
-        } catch {}
-        return;
-      }
-      if (s === "stop") {
-        try {
-          stream?.end();
-          ff?.end();
-        } catch {}
-      }
+      if (!stream) startStream();
+      audioPipe.write(msg); // PCM16LE@16k mono (10–20ms)
     });
 
-    ws.on("close", () => {
-      closed = true;
-      try {
-        stream?.end();
-      } catch {}
-      try {
-        ff?.end();
-      } catch {}
-    });
+    ws.on('close', ()=>safeClose());
+    ws.on('error', ()=>safeClose());
   });
-
-  return wss;
 }
