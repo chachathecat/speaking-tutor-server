@@ -1,41 +1,62 @@
-import express from 'express';
+// chat.js (핵심만)
 import fetch from 'node-fetch';
 
-const router = express.Router();
+export default async function chatRouter(req, res){
+  const { system, history, state, targetLang, nativeLang } = await req.json();
 
-router.post('/chat', async (req,res)=>{
-  const { system, history=[], state={}, targetLang='en-US', nativeLang='ko-KR' } = req.body || {};
-  const base = process.env.LLM_BASE_URL || 'https://api.openai.com';
-  const key  = process.env.LLM_API_KEY;
-  const model= process.env.LLM_MODEL || 'gpt-4o-mini';
-  if(!key) return res.status(500).json({ ok:false, error:'Missing LLM_API_KEY' });
+  const systemPrompt = (system || `
+You are a warm, upbeat speaking coach and dialogue partner.
+Speak concisely (1–2 sentences). Use natural conversational rhythm.
+ALWAYS finish with exactly one thoughtful follow-up question.
+Correct only impactful mistakes in ≤1 short line.
+Use ${targetLang} for conversation; use ${nativeLang} only for a brief tip if necessary.
+Adapt topic/level/speed based on state.wpm and state.scoring. Keep it friendly and curious.
+`).trim();
 
-  const messages = [];
-  if (system) messages.push({ role:'system', content: system.replace('{{targetLang}}',targetLang).replace('{{nativeLang}}',nativeLang) });
-  for (const m of history) messages.push({ role: m.role==='assistant'?'assistant':'user', content:String(m.content||'') });
-  messages.push({ role:'system', content:`Context: ${JSON.stringify({ targetLang, nativeLang, state }).slice(0,1000)}` });
+  // OpenAI/기타 LLM 엔드포인트로 스트리밍 요청 (모델/키는 ENV)
+  const r = await fetch(process.env.LLM_BASE_URL + '/v1/chat/completions', {
+    method: 'POST',
+    headers: { 
+      'Authorization': `Bearer ${process.env.LLM_API_KEY}`,
+      'Content-Type': 'application/json',
+      // 프런트에서 붙인 X-Edge-Token 검증은 index.js 미들웨어에서 이미 처리했다고 가정
+    },
+    body: JSON.stringify({
+      model: process.env.LLM_MODEL,         // 예: gpt-4o-mini / gpt-4.1-mini 등
+      stream: true,
+      temperature: 0.7,
+      messages: [
+        { role:'system', content: systemPrompt },
+        ...history.map(m=>({ role:m.role==='assistant'?'assistant':'user', content:m.content })),
+        { role:'user', content: `Current state: ${JSON.stringify(state)}` }
+      ]
+    })
+  });
 
-  res.writeHead(200, { 'Content-Type':'text/event-stream; charset=utf-8', 'Cache-Control':'no-cache, no-transform', 'Connection':'keep-alive' });
+  // SSE 파이프
+  res.writeHead(200,{
+    'Content-Type':'text/event-stream',
+    'Cache-Control':'no-cache',
+    'Connection':'keep-alive',
+    'Access-Control-Allow-Origin': process.env.CORS_ORIGIN || '*'
+  });
 
-  try{
-    const r = await fetch(`${base}/v1/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type':'application/json', 'Authorization': `Bearer ${key}` },
-      body: JSON.stringify({ model, stream:true, temperature:0.6, messages })
-    });
-    if (!r.ok || !r.body) throw new Error(`Upstream ${r.status}`);
-    const reader=r.body.getReader(); const dec=new TextDecoder();
-    while(true){
-      const { value, done } = await reader.read(); if (done) break;
-      for (const line of dec.decode(value).split('\n')){
-        if (!line.startsWith('data:')) continue;
-        const data=line.slice(5).trim(); if(!data || data==='[DONE]') continue;
-        try{ const j=JSON.parse(data); const d=j.choices?.[0]?.delta?.content||''; if(d) res.write(`data:${d}\n\n`); }
-        catch { res.write(`data:${data}\n\n`); }
-      }
+  const reader = r.body.getReader();
+  const dec = new TextDecoder();
+  while(true){
+    const { value, done } = await reader.read();
+    if(done) break;
+    const chunk = dec.decode(value);
+    // OpenAI 스트리밍을 "data: {delta}" 형태로 변환
+    for(const line of chunk.split('\n')){
+      if(!line.trim()) continue;
+      try{
+        const obj = JSON.parse(line.replace(/^data:\s*/,''));
+        const delta = obj.choices?.[0]?.delta?.content || '';
+        if(delta) res.write(`data:${delta}\n\n`);
+      }catch{ /* noop */ }
     }
-  }catch(e){ res.write(`data:[stream error]\n\n`); }
-  finally{ res.end(); }
-});
-
-export default router;
+  }
+  res.write('data:[DONE]\n\n');
+  res.end();
+}
